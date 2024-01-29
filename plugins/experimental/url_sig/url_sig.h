@@ -20,14 +20,14 @@
 
 /* in the query string that we add to sign the url: */
 #define CIP_QSTRING "C" /* C=24.0.33.12 designates the client IP address */
-#define EXP_QSTRING "E" /* E=1356128799 means expires at (seconds since Unix epoch) */
+#define EXP_QSTRING "timestamp" /* timestamp=1356128799 means expires at (seconds since Unix epoch) */
 #define ALG_QSTRING "A" /* A=1 means hashing algorithm 1 */
 #define KIN_QSTRING "K" /* K=3 means use key number 3 */
 #define PAR_QSTRING \
   "P" /* P=1110 means use parts 0, 1 and 2 (and no more) for the hashing of the url after removing the 'http://' */
       /* and making the parts by doing a split("/") */
 #define SIG_QSTRING                                                                                           \
-  "S" /* S=9e2828d570a4bee3c964f698b0985ee58b9f6b64 means 9e2828d570a4bee3c964f698b0985ee58b9f6b64 is the sig \
+  "token" /* token=9e2828d570a4bee3c964f698b0985ee58b9f6b64 means 9e2828d570a4bee3c964f698b0985ee58b9f6b64 is the sig \
          This one has to be the last one of the string */
 
 #define CIP_STRLEN 20
@@ -46,6 +46,8 @@
 #define MAX_KEY_LEN 256
 #define MAX_KEY_NUM 16
 #define MAX_QUERY_LEN 4096
+#define MAX_HASH_QUERY_PARAM_NUM 16
+#define MAX_HASH_QUERY_LEN 256
 
 #define USIG_HMAC_SHA1 1
 #define USIG_HMAC_MD5 2
