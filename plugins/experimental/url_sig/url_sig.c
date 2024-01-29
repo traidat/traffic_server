@@ -63,6 +63,9 @@ struct config {
   bool ignore_expiry;
   char hash_query_param[MAX_HASH_QUERY_PARAM_NUM][MAX_HASH_QUERY_LEN];
   int paramNum;
+  char* use_parts;
+  int algorithm;  
+  int knumber;
 };
 
 static void
@@ -71,6 +74,7 @@ free_cfg(struct config *cfg)
   TSDebug(PLUGIN_NAME, "Cleaning up");
   TSfree(cfg->err_url);
   TSfree(cfg->sig_anchor);
+  TSfree(cfg->use_parts);
 
   if (cfg->regex_extra) {
 #ifndef PCRE_STUDY_JIT_COMPILE
@@ -253,6 +257,13 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
         paramNum = paramNum + 1;
       }
       cfg->paramNum = paramNum;
+    } else if (strncmp(line, "use_parts", 9) == 0) {
+      cfg->use_parts = value;
+      TSDebug(PLUGIN_NAME, "Use_part: %s", cfg->use_parts);
+    } else if (strncmp(line, "algorithm", 9) == 0) {
+      cfg->algorithm = atoi(value);
+    } else if (strncmp(line, "knumber", 1) == 0) {
+      cfg->knumber = atoi(value);
     } else {
       TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
@@ -336,10 +347,9 @@ getAppQueryString(const char *query_string, int query_length)
   memset(result, '\0', sizeof(result));
   TSDebug(PLUGIN_NAME, "Result %s", result);
   do {
-    char* token = strstr(p, "token");
+    char* token = strstr(p, SIG_QSTRING "=");
     if (token != NULL) {
       TSDebug(PLUGIN_NAME, "Token %s", token);
-      // TODO: Verify case tokenizer=abc&token=bcd 
       done = 1;
       char* delimeter = strchr(token, '&');
       TSDebug(PLUGIN_NAME, "Delimeter %s", delimeter);
@@ -731,7 +741,11 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     // The check for a valid algorithm is later.
     TSDebug(PLUGIN_NAME, "Algorithm: %d", algorithm);
   } else {
-    algorithm = 2;
+    if (cfg->algorithm != 0) {
+      algorithm = cfg->algorithm;
+    } else {
+      algorithm = 2;
+    }
     TSDebug(PLUGIN_NAME, "Algorithm default: %d", algorithm);
   }
   // Key index
@@ -745,7 +759,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     }
     TSDebug(PLUGIN_NAME, "Key Index: %d", keyindex);
   } else {
-    keyindex = 1;
+    keyindex = cfg->knumber;
     if (keyindex < 0 || keyindex >= MAX_KEY_NUM || 0 == cfg->keys[keyindex][0]) {
       err_log(url, "Invalid key index");
       goto deny;
@@ -764,8 +778,14 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     } else {
       TSDebug(PLUGIN_NAME, "Parts: %s", parts);
     }
-  } else {
-    parts = "0011"; // NOTE parts is not NULL terminated it is terminated by "&" of next param
+  } else { 
+    if (cfg->use_parts != NULL) {
+      TSDebug(PLUGIN_NAME, "Use parts: %s", cfg->use_parts);
+      parts = cfg->use_parts;
+    } else {
+      parts = "0011";
+    }
+    parts = "1111";
     has_path_params == false ? (cp = strstr(parts, "&")) : (cp = strstr(parts, ";"));
     if (cp) {
       TSDebug(PLUGIN_NAME, "Parts default: %.*s", (int)(cp - parts), parts);
