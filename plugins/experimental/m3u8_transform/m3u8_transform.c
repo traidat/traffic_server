@@ -24,28 +24,39 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "ts/ts.h"
 #include "tscore/ink_defs.h"
 
-
 #define PLUGIN_NAME "m3u8_transform"
 
 #define ASSERT_SUCCESS(_x) TSAssert((_x) == TS_SUCCESS)
+#define MAX_FILE_LENGTH 100000
+#define MAX_URL_LEN 100
+#define MAX_REQ_LEN 8192
+#define MAX_KEY_LEN 256
+#define MAX_KEY_NUM 16
+#define MAX_QUERY_LEN 4096
+#define MAX_HASH_QUERY_PARAM_NUM 16
+#define MAX_HASH_QUERY_LEN 256
 
 typedef struct {
   TSVIO output_vio;
   TSIOBuffer output_buffer;
   TSIOBufferReader output_reader;
+  TSIOBuffer hash_buffer;
+  TSIOBufferReader hash_reader;
+  char* prefix;
+  char* query_string;
+  int prefix_length;
+  int query_string_length;
+  int file_size;
   int append_needed;
 } MyData;
 
-static TSIOBuffer append_buffer;
-static TSIOBufferReader append_buffer_reader;
-static int append_buffer_length;
-
 static MyData *
-my_data_alloc()
+my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int query_string_length)
 {
   MyData *data;
 
@@ -55,6 +66,15 @@ my_data_alloc()
   data->output_vio    = NULL;
   data->output_buffer = NULL;
   data->output_reader = NULL;
+  data->hash_buffer = NULL;
+  data->hash_reader = NULL;
+  data->prefix = TSmalloc(sizeof(prefix));
+  data->prefix_length = prefix_length;
+  strcpy(data->prefix, prefix);
+  data->query_string = TSmalloc(sizeof(query_string));
+  data->query_string_length = query_string_length;
+  data->file_size = 0;
+  strcpy(data->query_string, query_string);
   data->append_needed = 1;
 
   return data;
@@ -67,8 +87,117 @@ my_data_destroy(MyData *data)
     if (data->output_buffer) {
       TSIOBufferDestroy(data->output_buffer);
     }
+    if (data->hash_buffer) {
+      TSIOBufferDestroy(data->hash_buffer);
+    }
+    if (data->prefix) {
+      TSfree(data->prefix);
+    }
+    if (data->query_string) {
+      TSfree(data->query_string);
+    }
     TSfree(data);
   }
+}
+
+
+// Verify request is m3u8 file and get prefix and query_string of request URL
+bool 
+verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query_string, int* query_string_length) {
+  TSMBuffer buf;
+  TSMLoc loc;
+
+  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
+    int host_length = 0;
+    int scheme_length = 0;
+    int path_length = 0;
+    int query_param_length = 0;
+    TSMLoc url_loc;
+    if (TS_SUCCESS == TSHttpHdrUrlGet(buf, loc, &url_loc)) {
+      const char* path = TSUrlPathGet(buf, url_loc, &path_length);
+      // TODO: Use regex to verify request m3u8 file. Now just check contain .m3u8
+      if (strstr(path, ".m3u8") == NULL) {
+        ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
+        ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+        return false;
+      }
+
+      const char* scheme = TSUrlSchemeGet(buf, url_loc, &scheme_length);
+      const char* query_param = TSUrlHttpQueryGet(buf, url_loc, &query_param_length);
+      TSMLoc remap_loc;
+      prefix = strncat(prefix, scheme, scheme_length);
+      prefix = strncat(prefix, "://", 3);
+      if (TS_SUCCESS == TSRemapFromUrlGet(txnp, &remap_loc)) {
+        const char* host = TSUrlHostGet(buf, remap_loc, &host_length);
+        prefix = strncat(prefix, host, host_length);
+        ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, remap_loc));
+      } else {
+        const char* host = TSUrlHostGet(buf, url_loc, &host_length);
+        prefix = strncat(prefix, host, host_length);
+      }
+      prefix = strncat(prefix, "/", 1);
+      prefix = strncat(prefix, path, path_length);
+      (*prefix_length) = (*prefix_length) + scheme_length + 3 + host_length + 1;
+      char* file_name = strrchr(prefix, '/');
+      if (file_name != NULL) {
+        *(file_name + 1) = '\0';
+        (*prefix_length) = (file_name - prefix);
+      } else {
+        *(prefix + scheme_length + 3 + host_length) = '\0';
+      }
+      query_string = strncat(query_string, "?", 1);
+      query_string = strncat(query_string, query_param, query_param_length);
+      *(query_string + query_param_length) = '\0';
+      (*query_string_length) = (*query_string_length) + query_param_length + 1;
+      
+      ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
+      ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+      
+      TSDebug(PLUGIN_NAME, "Prefix URL: %s", prefix);
+      TSDebug(PLUGIN_NAME, "Query param string: %s", query_string);
+      return true;
+    }
+  }
+ 
+  TSDebug(PLUGIN_NAME, "Cannot get request");
+  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+  return false;
+}
+
+
+// Add prefix cache domain and token to every link inside m3u8 file
+char* 
+add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, char* query_string, int query_string_length, int* data_size) {
+    char buf[MAX_FILE_LENGTH + 1];
+    char* result = buf;
+    const char *delimiter = "\n";
+    char *line;
+    char* temp = strdup(file_data);
+    
+    line = strtok(temp, delimiter);
+    while (line != NULL) {
+      TSDebug(PLUGIN_NAME, "Line: %s", line);
+      if (*(line) != '#') {
+        if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL)) {
+          strcat(result, prefix);
+          strcat(result, line);
+          strcat(result, query_string);
+          (*data_size) = (*data_size) + prefix_length + query_string_length;
+        } else {
+          strcat(result, line);
+        }
+      } else {
+        strcat(result, line);
+      }
+      line = strtok(NULL, delimiter);
+      if (line != NULL) {
+        strncat(result, "\n", 1);
+      }
+    }
+
+    free(temp);
+
+    return result;
 }
 
 static void
@@ -95,14 +224,16 @@ handle_transform_m3u8(TSCont contp)
   data = TSContDataGet(contp);
   if (!data) {
     towrite = TSVIONBytesGet(write_vio);
-    if (towrite != INT64_MAX) {
-      towrite += append_buffer_length;
-    }
-    data                = my_data_alloc();
+    data                = my_data_alloc_with_url("", 0,"", 0);
     data->output_buffer = TSIOBufferCreate();
     data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
     data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, towrite);
     TSContDataSet(contp, data);
+  } else if (data->output_vio == NULL) {
+    towrite = TSVIONBytesGet(write_vio);
+    data->output_buffer = TSIOBufferCreate();
+    data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
+    data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, towrite);
   }
 
   /* We also check to see if the write VIO's buffer is non-NULL. A
@@ -113,12 +244,11 @@ handle_transform_m3u8(TSCont contp)
      transformation we might have to finish writing the transformed
      data to our output connection. */
   if (!TSVIOBufferGet(write_vio)) {
-    // if (data->append_needed) {
-    //   data->append_needed = 0;
-    //   TSIOBufferCopy(TSVIOBufferGet(data->output_vio), append_buffer_reader, append_buffer_length, 0);
-    // }
-
-    TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
+    char debug_file[data->file_size + 1];
+    TSIOBufferReaderCopy(data->output_reader, debug_file, data->file_size);
+    TSDebug(PLUGIN_NAME, "Debug file output: %s", debug_file);
+    TSDebug(PLUGIN_NAME, "Debug file size: %d", data->file_size);
+    TSVIONBytesSet(data->output_vio, data->file_size);
     TSVIOReenable(data->output_vio);
 
     return;
@@ -135,7 +265,6 @@ handle_transform_m3u8(TSCont contp)
     if (towrite > avail) {
       towrite = avail;
     }
-
     if (towrite > 0) {
       /* Copy the data from the read buffer to the output buffer. */
       TSIOBufferCopy(TSVIOBufferGet(data->output_vio), TSVIOReaderGet(write_vio), towrite, 0);
@@ -165,24 +294,28 @@ handle_transform_m3u8(TSCont contp)
       TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_READY, write_vio);
     }
   } else {
-    // if (data->append_needed) {
-    //   data->append_needed = 0;
-    //   TSIOBufferCopy(TSVIOBufferGet(data->output_vio), append_buffer_reader, append_buffer_length, 0);
-    // }
-
     /* If there is no data left to read, then we modify the output
        VIO to reflect how much data the output connection should
        expect. This allows the output connection to know when it
        is done reading. We then reenable the output connection so
        that it can consume the data we just gave it. */
-    TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
-    char file_data[100000];
-    TSDebug(PLUGIN_NAME, "File size: %ld", TSVIONDoneGet(write_vio));
-    TSIOBufferReaderCopy(data->output_reader, file_data, TSVIONDoneGet(write_vio));
-    TSDebug(PLUGIN_NAME, "Data: %s", file_data);
+    TSDebug(PLUGIN_NAME, "Request prefix: %s", data->prefix);
+    TSDebug(PLUGIN_NAME, "Request query string: %s", data->query_string);
+    TSDebug(PLUGIN_NAME, "Write length: %ld", TSVIONDoneGet(write_vio));
+    int data_size = TSIOBufferReaderAvail(data->output_reader);
+    char file_data[data_size + 1];
+    TSIOBufferReaderCopy(data->output_reader, file_data, data_size);
+    
+    char* result = add_token_and_prefix(file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
+    TSDebug(PLUGIN_NAME, "File size after transform: %d", data_size);
+    TSDebug(PLUGIN_NAME, "File after transform: %s", result);
+    data->file_size = data_size;
+    TSIOBufferReaderConsume(data->output_reader, TSIOBufferReaderAvail(data->output_reader));
+    TSIOBufferWrite(data->output_buffer, result, data_size);
+    TSVIONBytesSet(data->output_vio, data_size);
     TSVIOReenable(data->output_vio);
 
-    /* Call back the write VIO continuation to let it know that we
+    /* Call back the write VIO continuation to let it know that wek
        have completed the write operation. */
     TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_COMPLETE, write_vio);
   }
@@ -254,31 +387,53 @@ transformable(TSHttpTxn txnp)
   return 0; /* not a 200 */
 }
 
-static char* 
+const char* 
 getUrlRequest(TSHttpTxn txnp) 
 {
-  TSMBuffer bufp;
+  TSMBuffer buf;
   TSMLoc loc;
-  if (TS_SUCCESS == TSHttpTxnServerReqGet(txnp, &bufp, &loc)) {
+
+  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
     int length;
-    char store[2048];
-    char *buf = TSHttpTxnEffectiveUrlStringGet(txnp, &length);
-    if (buf) {
-      TSDebug(PLUGIN_NAME, "URL: %s", buf);
-      return buf;
+    char *url = TSHttpTxnEffectiveUrlStringGet(txnp, &length);
+    if (url) {
+      TSDebug(PLUGIN_NAME, "URL: %s", url);
+      
+      ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+      return url;
     }
   }
  
   TSDebug(PLUGIN_NAME, "Cannot get request ");
-  ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, loc));
+  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+  return NULL;
+}
+
+char* 
+getUrlRequestV2(TSHttpTxn txnp) 
+{
+  TSMBuffer buf;
+  TSMLoc loc;
+  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
+    TSMLoc url_loc;
+    int length = 0;
+    TSRemapFromUrlGet(txnp, &url_loc);
+    const char* host = TSUrlHostGet(buf, url_loc, &length);
+    TSDebug(PLUGIN_NAME, "Url: %s", host);
+  }
+ 
+  TSDebug(PLUGIN_NAME, "Cannot get request ");
+  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
   return NULL;
 }
 
 static void 
-transform_m3u8(TSHttpTxn txnp) {
+transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
   TSVConn connp;
-
+  
   connp = TSTransformCreate(add_token_transform, txnp);
+  MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+  TSContDataSet(connp, data);
   TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
 }
 
@@ -291,12 +446,17 @@ transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
   switch (event) {
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
     if (transformable(txnp)) {
-      const char* url = getUrlRequest(txnp);
+      char prefix_store[MAX_URL_LEN];
+      char* prefix = prefix_store;
+      char query_string_store[MAX_URL_LEN];
+      char* query_string = query_string_store;
+      int prefix_length = 0;
+      int query_string_length = 0;
+      bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
 
-      // TODO: Filter url by regex. Now just transform every file with url contain .m3u8
-      char* m38uFileExtension = strstr(url, ".m3u8"); 
-      if (m38uFileExtension != NULL) {
-        transform_m3u8(txnp);
+      // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
+      if (is_m3u8) {
+        transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
       }
     }
     TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
@@ -318,23 +478,6 @@ load(const char *filename)
   if (!fp) {
     return 0;
   }
-
-  append_buffer        = TSIOBufferCreate();
-  append_buffer_reader = TSIOBufferReaderAlloc(append_buffer);
-
-  for (;;) {
-    TSIOBufferBlock blk = TSIOBufferStart(append_buffer);
-    char *p             = TSIOBufferBlockWriteStart(blk, &avail);
-
-    int err = TSfread(fp, p, avail);
-    if (err > 0) {
-      TSIOBufferProduce(append_buffer, err);
-    } else {
-      break;
-    }
-  }
-
-  append_buffer_length = TSIOBufferReaderAvail(append_buffer_reader);
 
   TSfclose(fp);
   return 1;
