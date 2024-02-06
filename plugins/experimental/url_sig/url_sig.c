@@ -63,7 +63,7 @@ struct config {
   bool ignore_expiry;
   char hash_query_param[MAX_HASH_QUERY_PARAM_NUM][MAX_HASH_QUERY_LEN];
   int paramNum;
-  char* use_parts;
+  char use_parts[MAX_USE_PARTS_LEN];
   int algorithm;  
   int knumber;
 };
@@ -74,7 +74,6 @@ free_cfg(struct config *cfg)
   TSDebug(PLUGIN_NAME, "Cleaning up");
   TSfree(cfg->err_url);
   TSfree(cfg->sig_anchor);
-  TSfree(cfg->use_parts);
 
   if (cfg->regex_extra) {
 #ifndef PCRE_STUDY_JIT_COMPILE
@@ -258,7 +257,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
       }
       cfg->paramNum = paramNum;
     } else if (strncmp(line, "use_parts", 9) == 0) {
-      cfg->use_parts = value;
+      snprintf(&cfg->use_parts[0], MAX_USE_PARTS_LEN, "%s", value);
       TSDebug(PLUGIN_NAME, "Use_part: %s", cfg->use_parts);
     } else if (strncmp(line, "algorithm", 9) == 0) {
       cfg->algorithm = atoi(value);
@@ -785,7 +784,6 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     } else {
       parts = "0011";
     }
-    parts = "1111";
     has_path_params == false ? (cp = strstr(parts, "&")) : (cp = strstr(parts, ";"));
     if (cp) {
       TSDebug(PLUGIN_NAME, "Parts default: %.*s", (int)(cp - parts), parts);
