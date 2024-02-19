@@ -25,18 +25,29 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
 #include "ts/ts.h"
 #include "tscore/ink_defs.h"
 
+
+
 #define PLUGIN_NAME "m3u8_transform"
+#define USIG_HMAC_SHA1 1
+#define USIG_HMAC_MD5 2
+#define SHA1_SIG_SIZE 20
+#define MD5_SIG_SIZE 16
+#define MAX_SIG_SIZE 20
 
 #define ASSERT_SUCCESS(_x) TSAssert((_x) == TS_SUCCESS)
 #define MAX_FILE_LENGTH 100000
-#define MAX_URL_LEN 100
+#define MAX_URL_LEN 4096
 #define MAX_REQ_LEN 8192
 #define MAX_KEY_LEN 256
 #define MAX_KEY_NUM 16
+#define MAX_USE_PARTS_LEN 10
 #define MAX_QUERY_LEN 4096
 #define MAX_HASH_QUERY_PARAM_NUM 16
 #define MAX_HASH_QUERY_LEN 256
@@ -55,6 +66,17 @@ typedef struct {
   int append_needed;
 } MyData;
 
+struct config {
+  char keys[MAX_KEY_NUM][MAX_KEY_LEN];
+  char hash_query_param[MAX_HASH_QUERY_PARAM_NUM][MAX_HASH_QUERY_LEN];
+  int paramNum;
+  char use_parts[MAX_USE_PARTS_LEN];
+  int algorithm;  
+  int knumber;
+};
+
+struct config *cfg;
+
 static MyData *
 my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int query_string_length)
 {
@@ -68,10 +90,10 @@ my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int 
   data->output_reader = NULL;
   data->hash_buffer = NULL;
   data->hash_reader = NULL;
-  data->prefix = TSmalloc(sizeof(prefix));
+  data->prefix = malloc(prefix_length + 1);
   data->prefix_length = prefix_length;
   strcpy(data->prefix, prefix);
-  data->query_string = TSmalloc(sizeof(query_string));
+  data->query_string = malloc(query_string_length + 1);
   data->query_string_length = query_string_length;
   data->file_size = 0;
   strcpy(data->query_string, query_string);
@@ -91,13 +113,22 @@ my_data_destroy(MyData *data)
       TSIOBufferDestroy(data->hash_buffer);
     }
     if (data->prefix) {
-      TSfree(data->prefix);
+      free(data->prefix);
     }
     if (data->query_string) {
-      TSfree(data->query_string);
+      free(data->query_string);
     }
     TSfree(data);
   }
+}
+
+static void
+free_cfg(struct config *cfg)
+{
+  TSDebug(PLUGIN_NAME, "Cleaning up");
+  TSfree(cfg->use_parts);
+
+  TSfree(cfg);
 }
 
 
@@ -141,14 +172,15 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       char* file_name = strrchr(prefix, '/');
       if (file_name != NULL) {
         *(file_name + 1) = '\0';
-        (*prefix_length) = (file_name - prefix);
+        (*prefix_length) = (file_name - prefix + 1);
       } else {
         *(prefix + scheme_length + 3 + host_length) = '\0';
       }
       query_string = strncat(query_string, "?", 1);
       query_string = strncat(query_string, query_param, query_param_length);
-      *(query_string + query_param_length) = '\0';
       (*query_string_length) = (*query_string_length) + query_param_length + 1;
+      *(query_string + query_param_length + 1) = '\0';
+      
       
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
@@ -164,8 +196,92 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
   return false;
 }
 
+bool
+generate_token(char* url, unsigned char* token, unsigned int* token_length) {
+  const char *query = strchr(url, '?');
+  char signed_part[MAX_URL_LEN] = {'\0'};
+  char urltokstr[MAX_URL_LEN] = {'\0'};
+  char* cp = strchr(url, '?');
+  int j = 0;
+  TSDebug(PLUGIN_NAME, "Url: %s", url);
+  // Skip scheme and initial forward slashes.
+  const char *skip = strchr(url, ':');
+  if (!skip || skip[1] != '/' || skip[2] != '/') {
+    return false;
+  }
+  skip += 3;
+  memcpy(urltokstr, skip, cp - skip);
+  char *strtok_r_p;
+  const char *part = strtok_r(urltokstr, "/", &strtok_r_p);
+  while (part != NULL) {
+    if (cfg->use_parts[j] == '1') {
+      strncat(signed_part, part, sizeof(signed_part) - strlen(signed_part) - 1);
+      strncat(signed_part, "/", sizeof(signed_part) - strlen(signed_part) - 1);
+    }
+    if (cfg->use_parts[j + 1] == '0' ||
+        cfg->use_parts[j + 1] == '1') { // This remembers the last part, meaning, if there are no more valid letters in parts
+      j++;                     // will keep repeating the value of the last one
+    }
+    part = strtok_r(NULL, "/", &strtok_r_p);
+  }
+
+
+  // chop off the last /, replace with '?' or ';' as appropriate.
+  signed_part[strlen(signed_part) - 1] = '?';
+  char* query_params[sizeof(cfg->hash_query_param)];
+  char* delimeterParam;
+  for (int i = 0; i < cfg->paramNum; i++) {
+    TSDebug(PLUGIN_NAME, "Hash parameter %d: %s", i, cfg->hash_query_param[i]);
+    query_params[i] = strstr(query, cfg->hash_query_param[i]);
+    if (query_params[i] == NULL) {
+      TSError("Missing hash parameter of %s", url);
+      return false;
+    }
+    delimeterParam = strstr(query_params[i], "&");
+    TSDebug(PLUGIN_NAME, "Pointer query param: %s", query_params[i]);
+    TSDebug(PLUGIN_NAME, "Delimeter: %s", delimeterParam);
+    if (i == cfg-> paramNum - 1) {
+      strncat(signed_part, query_params[i], (delimeterParam - query_params[i]));
+    } else {
+      strncat(signed_part, query_params[i], (delimeterParam - query_params[i]) + 1);
+    }
+  }
+  // signed_part[strlen(signed_part)] = '\0';
+  TSDebug(PLUGIN_NAME, "cp: %s, query: %s, signed_part: %s", cp, query, signed_part);
+  TSDebug(PLUGIN_NAME, "Signed string=\"%s\"", signed_part);
+  switch (cfg->algorithm) {
+  case USIG_HMAC_SHA1:
+    HMAC(EVP_sha1(), (const unsigned char *)cfg->keys[cfg->knumber], strlen(cfg->keys[cfg->knumber]), (const unsigned char *)signed_part,
+         strlen(signed_part), token, token_length);
+    if ((*token_length) != SHA1_SIG_SIZE) {
+      TSDebug(PLUGIN_NAME, "sig_len: %d", (*token_length));
+      TSError("Calculated sig len of %s !=  SHA1_SIG_SIZE !", url);
+      return false;
+    }
+    TSDebug(PLUGIN_NAME, "HmacSHA1 of signed_part %s: %s", signed_part, token);
+    return true;
+  case USIG_HMAC_MD5:
+    HMAC(EVP_md5(), (const unsigned char *)cfg->keys[cfg->knumber], strlen(cfg->keys[cfg->knumber]), (const unsigned char *)signed_part,
+         strlen(signed_part), token, token_length);
+    // HMAC(EVP_md5(), (const unsigned char *)"px0KnwI_hxaS8uNzLOUZw6lVuBqVggJH", 32, (const unsigned char *) "10.61.129.17:8080/file/index.m3u8?timestamp=2526689025",
+    //      54, token, token_length);
+    if ((*token_length) != MD5_SIG_SIZE) {
+      TSDebug(PLUGIN_NAME, "sig_len: %d", (*token_length));
+      TSError("Calculated sig len of %s !=  MD5_SIG_SIZE !", url);
+      return false;
+    }
+    TSDebug(PLUGIN_NAME, "HmacMD5 of signed_part %s: %s", signed_part, token);
+    return true;
+  default:
+    TSError("Algorithm not supported: %d", cfg->algorithm);
+    return false;
+  }
+  signed_part[0] = '\0';
+}
+
 
 // Add prefix cache domain and token to every link inside m3u8 file
+// TODO: Add token to subtag URL 
 char* 
 add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, char* query_string, int query_string_length, int* data_size) {
     char buf[MAX_FILE_LENGTH + 1];
@@ -173,16 +289,56 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     const char *delimiter = "\n";
     char *line;
     char* temp = strdup(file_data);
-    
+    TSDebug(PLUGIN_NAME, "Prefix %s length %d", prefix, prefix_length);
+    TSDebug(PLUGIN_NAME, "Query string %s length %d", query_string, query_string_length);
+
     line = strtok(temp, delimiter);
     while (line != NULL) {
       TSDebug(PLUGIN_NAME, "Line: %s", line);
       if (*(line) != '#') {
         if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL)) {
-          strcat(result, prefix);
+          char url_store[MAX_URL_LEN];
+          char* url = url_store;
+          unsigned char token_store[MAX_SIG_SIZE + 1];
+          unsigned char* token = token_store;
+          unsigned int token_length = 0;
+
+          // Generate token from url
+          strncat(url, prefix, prefix_length);
+          strcat(url, line);
+          if (query_string_length > 0 && strstr(url, query_string) == NULL) {
+            strncat(url, query_string, query_string_length);
+          } else if (query_string_length > 0 && strstr(url, "?") == NULL) {
+            *(query_string) = '&';
+            strncat(url, query_string, query_string_length);
+          }
+
+          // Add line to result (adding prefix, query_string, token if needed)
+          strncat(result, prefix, prefix_length);
+          (*data_size) = (*data_size) + prefix_length;
           strcat(result, line);
-          strcat(result, query_string);
-          (*data_size) = (*data_size) + prefix_length + query_string_length;
+          if (query_string_length > 0 && strstr(line, query_string) == NULL) {
+            strncat(result, query_string, query_string_length);
+            (*data_size) = (*data_size) + query_string_length;
+          } else if (query_string_length > 0 && strstr(line, "?") == NULL) {
+            *(query_string) = '&';
+            strncat(result, query_string, query_string_length);
+            (*data_size) = (*data_size) + query_string_length;
+          }
+
+          bool is_success = generate_token(url, token, &token_length);
+          if (is_success) {
+            strncat(result, "&token=", 7);
+            char token_string[2 * MAX_SIG_SIZE + 1];
+            for (int i = 0; i < (int) token_length; i++) {
+              sprintf(&(token_string[i * 2]), "%02x", token[i]);
+            }
+            TSDebug(PLUGIN_NAME, "Token of url %s: %s", url, token_string);
+            strncat(result, token_string, token_length * 2);
+            (*data_size) = (*data_size) + MD5_SIG_SIZE * 2 + 7;
+          }
+          
+          url_store[0] = '\0';
         } else {
           strcat(result, line);
         }
@@ -244,10 +400,6 @@ handle_transform_m3u8(TSCont contp)
      transformation we might have to finish writing the transformed
      data to our output connection. */
   if (!TSVIOBufferGet(write_vio)) {
-    char debug_file[data->file_size + 1];
-    TSIOBufferReaderCopy(data->output_reader, debug_file, data->file_size);
-    TSDebug(PLUGIN_NAME, "Debug file output: %s", debug_file);
-    TSDebug(PLUGIN_NAME, "Debug file size: %d", data->file_size);
     TSVIONBytesSet(data->output_vio, data->file_size);
     TSVIOReenable(data->output_vio);
 
@@ -304,15 +456,22 @@ handle_transform_m3u8(TSCont contp)
     TSDebug(PLUGIN_NAME, "Write length: %ld", TSVIONDoneGet(write_vio));
     int data_size = TSIOBufferReaderAvail(data->output_reader);
     char file_data[data_size + 1];
+    /* Copy file data from buffer*/
     TSIOBufferReaderCopy(data->output_reader, file_data, data_size);
+    TSDebug(PLUGIN_NAME, "File data: %s", file_data);
     
+    /* Add token and prefix to every link in file*/
     char* result = add_token_and_prefix(file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
     TSDebug(PLUGIN_NAME, "File size after transform: %d", data_size);
     TSDebug(PLUGIN_NAME, "File after transform: %s", result);
     data->file_size = data_size;
+
+    /* Remove all data from reader and add content of file after tranform to reader*/
     TSIOBufferReaderConsume(data->output_reader, TSIOBufferReaderAvail(data->output_reader));
     TSIOBufferWrite(data->output_buffer, result, data_size);
+    *(result) = '\0';
     TSVIONBytesSet(data->output_vio, data_size);
+
     TSVIOReenable(data->output_vio);
 
     /* Call back the write VIO continuation to let it know that wek
@@ -387,46 +546,6 @@ transformable(TSHttpTxn txnp)
   return 0; /* not a 200 */
 }
 
-const char* 
-getUrlRequest(TSHttpTxn txnp) 
-{
-  TSMBuffer buf;
-  TSMLoc loc;
-
-  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
-    int length;
-    char *url = TSHttpTxnEffectiveUrlStringGet(txnp, &length);
-    if (url) {
-      TSDebug(PLUGIN_NAME, "URL: %s", url);
-      
-      ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
-      return url;
-    }
-  }
- 
-  TSDebug(PLUGIN_NAME, "Cannot get request ");
-  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
-  return NULL;
-}
-
-char* 
-getUrlRequestV2(TSHttpTxn txnp) 
-{
-  TSMBuffer buf;
-  TSMLoc loc;
-  if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
-    TSMLoc url_loc;
-    int length = 0;
-    TSRemapFromUrlGet(txnp, &url_loc);
-    const char* host = TSUrlHostGet(buf, url_loc, &length);
-    TSDebug(PLUGIN_NAME, "Url: %s", host);
-  }
- 
-  TSDebug(PLUGIN_NAME, "Cannot get request ");
-  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
-  return NULL;
-}
-
 static void 
 transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
   TSVConn connp;
@@ -446,9 +565,9 @@ transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
   switch (event) {
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
     if (transformable(txnp)) {
-      char prefix_store[MAX_URL_LEN];
+      char prefix_store[MAX_URL_LEN] = {'\0'};
       char* prefix = prefix_store;
-      char query_string_store[MAX_URL_LEN];
+      char query_string_store[MAX_URL_LEN] = {'\0'};
       char* query_string = query_string_store;
       int prefix_length = 0;
       int query_string_length = 0;
@@ -471,15 +590,98 @@ transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
 static int
 load(const char *filename)
 {
-  TSFile fp;
-  int64_t avail;
+  TSFile file;
+  TSDebug(PLUGIN_NAME, "Config file name: %s", filename);
 
-  fp = TSfopen(filename, "r");
-  if (!fp) {
+  file = TSfopen(filename, "r");
+  if (!file) {
     return 0;
   }
+  char line[300];
+  int line_no = 0;
+  int keynum;
+  int paramNum = 0;
+  bool eat_comment = false;
 
-  TSfclose(fp);
+  cfg = TSmalloc(sizeof(struct config));
+  memset(cfg, 0, sizeof(struct config));
+
+  while (TSfgets(file, line, sizeof(line)) != NULL) {
+    TSDebug(PLUGIN_NAME, "LINE: %s (%d)", line, (int)strlen(line));
+    line_no++;
+
+    if (eat_comment) {
+      // Check if final char is EOL, if so we are done eating
+      if (line[strlen(line) - 1] == '\n') {
+        eat_comment = false;
+      }
+      continue;
+    }
+    if (line[0] == '#' || strlen(line) <= 1) {
+      // Check if we have a comment longer than the full buffer if no EOL
+      if (line[strlen(line) - 1] != '\n') {
+        eat_comment = true;
+      }
+      continue;
+    }
+    char *pos = strchr(line, '=');
+    if (pos == NULL) {
+      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, filename, line);
+      continue;
+    }
+    *pos        = '\0';
+    char *value = pos + 1;
+    while (isspace(*value)) { // remove whitespace
+      value++;
+    }
+    pos = strchr(value, '\n'); // remove the new line, terminate the string
+    if (pos != NULL) {
+      *pos = '\0';
+    }
+    if (pos == NULL || strlen(value) >= MAX_KEY_LEN) {
+      TSfclose(file);
+      free_cfg(cfg);
+      return TS_ERROR;
+    }
+    if (strncmp(line, "key", 3) == 0) {
+      if (strncmp(line + 3, "0", 1) == 0) {
+        keynum = 0;
+      } else {
+        TSDebug(PLUGIN_NAME, ">>> %s <<<", line + 3);
+        keynum = atoi(line + 3);
+        if (keynum == 0) {
+          keynum = -1; // Not a Number
+        }
+      }
+      TSDebug(PLUGIN_NAME, "key number %d == %s", keynum, value);
+      if (keynum >= MAX_KEY_NUM || keynum < 0) {
+        TSfclose(file);
+        free_cfg(cfg);
+        return TS_ERROR;
+      }
+      snprintf(&cfg->keys[keynum][0], MAX_KEY_LEN, "%s", value);
+    } else if (strncmp(line, "hash_query_param", 16) == 0) {
+      char* param;
+      while ((param = strtok_r(value, ",", &param))) {
+        TSDebug(PLUGIN_NAME, "Param number %d: %s", paramNum, param);
+        snprintf(&cfg->hash_query_param[paramNum][0], MAX_HASH_QUERY_LEN, "%s", param);
+        value = value + strlen(param) + 1;
+        paramNum = paramNum + 1;
+      }
+      cfg->paramNum = paramNum;
+    } else if (strncmp(line, "use_parts", 9) == 0) {
+      snprintf(&cfg->use_parts[0], MAX_USE_PARTS_LEN, "%s", value);
+      TSDebug(PLUGIN_NAME, "Use_part: %s", cfg->use_parts);
+    } else if (strncmp(line, "algorithm", 9) == 0) {
+      cfg->algorithm = atoi(value);
+    } else if (strncmp(line, "knumber", 1) == 0) {
+      cfg->knumber = atoi(value);
+    } else {
+      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, filename, line);
+    }
+  }
+
+  TSfclose(file);
   return 1;
 }
 
@@ -489,8 +691,7 @@ TSPluginInit(int argc, const char *argv[])
   TSPluginRegistrationInfo info;
 
   info.plugin_name   = PLUGIN_NAME;
-  info.vendor_name   = "Apache Software Foundation";
-  info.support_email = "dev@trafficserver.apache.org";
+  info.vendor_name   = "VTNET";
   TSDebug(PLUGIN_NAME, "Start m3u8 transform plugin");
 
   if (TSPluginRegister(&info) != TS_SUCCESS) {
