@@ -28,6 +28,7 @@
 #include <ctype.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <zlib.h>
 
 #include "ts/ts.h"
 #include "tscore/ink_defs.h"
@@ -51,19 +52,19 @@
 #define MAX_QUERY_LEN 4096
 #define MAX_HASH_QUERY_PARAM_NUM 16
 #define MAX_HASH_QUERY_LEN 256
+#define GZIP_MAGIC_0    0x1F
+#define GZIP_MAGIC_1    0x8B
+#define GZIP_METHOD     0x08
 
 typedef struct {
   TSVIO output_vio;
   TSIOBuffer output_buffer;
   TSIOBufferReader output_reader;
-  TSIOBuffer hash_buffer;
-  TSIOBufferReader hash_reader;
   char* prefix;
   char* query_string;
   int prefix_length;
   int query_string_length;
   int file_size;
-  int append_needed;
 } MyData;
 
 struct config {
@@ -88,8 +89,6 @@ my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int 
   data->output_vio    = NULL;
   data->output_buffer = NULL;
   data->output_reader = NULL;
-  data->hash_buffer = NULL;
-  data->hash_reader = NULL;
   data->prefix = malloc(prefix_length + 1);
   data->prefix_length = prefix_length;
   strcpy(data->prefix, prefix);
@@ -97,7 +96,6 @@ my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int 
   data->query_string_length = query_string_length;
   data->file_size = 0;
   strcpy(data->query_string, query_string);
-  data->append_needed = 1;
 
   return data;
 }
@@ -108,9 +106,6 @@ my_data_destroy(MyData *data)
   if (data) {
     if (data->output_buffer) {
       TSIOBufferDestroy(data->output_buffer);
-    }
-    if (data->hash_buffer) {
-      TSIOBufferDestroy(data->hash_buffer);
     }
     if (data->prefix) {
       free(data->prefix);
@@ -133,6 +128,7 @@ free_cfg(struct config *cfg)
 
 
 // Verify request is m3u8 file and get prefix and query_string of request URL
+// TODO: Verify host is IP or domain, port is 80, 443 or not
 bool 
 verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query_string, int* query_string_length) {
   TSMBuffer buf;
@@ -356,6 +352,114 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     return result;
 }
 
+bool 
+is_gzip_data(const unsigned char *buffer, size_t size) {
+    if (size < 2) {
+        return false; // Buffer is too small to contain gzip header
+    }
+
+    if (buffer[0] != GZIP_MAGIC_0 || buffer[1] != GZIP_MAGIC_1) {
+        return false; // Magic number mismatch, not a gzip file
+    }
+
+    if (size < 3) {
+        return true; // Buffer contains gzip magic number only
+    }
+
+    if (buffer[2] != GZIP_METHOD) {
+        return false; // Compression method mismatch
+    }
+
+    return true; // Likely a gzip file
+}
+
+static char*
+gzip_data(char* data, int* data_size) {
+  // Allocate memory for compressed data
+  size_t compressed_capacity = compressBound(*data_size);
+  unsigned char *compressed_data = (unsigned char *)malloc(compressed_capacity);
+  if (compressed_data == NULL) {
+      fprintf(stderr, "Failed to allocate memory\n");
+      return NULL;
+  }
+
+  // Compress data using zlib
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  stream.next_in = (Bytef *)data;
+  stream.avail_in = *data_size;
+  stream.next_out = compressed_data;
+  stream.avail_out = compressed_capacity;
+
+  if (deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+      fprintf(stderr, "Failed to initialize zlib\n");
+      free(compressed_data);
+      return NULL;
+  }
+
+  if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+      fprintf(stderr, "Failed to compress data\n");
+      deflateEnd(&stream);
+      free(compressed_data);
+      return NULL;
+  }
+
+  deflate(&stream, Z_FINISH);
+  deflateEnd(&stream);
+
+  TSDebug(PLUGIN_NAME, "Compress data: %s", compressed_data);
+  TSDebug(PLUGIN_NAME, "Compress data size: %ld", stream.total_out);
+  *data_size = stream.total_out;
+
+  // Free compressed data buffer
+  free(compressed_data);
+
+  return (char *)compressed_data;
+}
+
+static unsigned char*
+unzip_file_data (unsigned char* compressed_data, int* data_size) {
+  // Allocate memory for decompressed data
+  int decompressed_size = MAX_FILE_LENGTH; // Adjust as needed
+  unsigned char *decompressed_data = (unsigned char *)malloc(decompressed_size);
+
+  if (decompressed_data == NULL) {
+      fprintf(stderr, "Failed to allocate memory\n");
+      return NULL;
+  }
+
+  // Decompress data using zlib
+  z_stream stream;
+  memset(&stream, 0, sizeof(stream));
+  stream.next_in = compressed_data;
+  stream.avail_in = *data_size;
+  stream.next_out = decompressed_data;
+  stream.avail_out = decompressed_size;
+
+  if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
+      TSDebug(PLUGIN_NAME, "Failed to initialize zlib\n");
+      free(decompressed_data);
+      return NULL;
+  }
+
+  int ret = inflate(&stream, Z_FINISH);
+  if (ret != Z_STREAM_END) {
+      TSDebug(PLUGIN_NAME, "Failed to decompress data\n");
+      inflateEnd(&stream);
+      free(decompressed_data);
+      return NULL;
+  }
+
+  inflateEnd(&stream);
+
+  // Print decompressed data
+  TSDebug(PLUGIN_NAME, "Decompressed data: %s", decompressed_data);
+  *data_size = stream.total_out;
+  TSDebug(PLUGIN_NAME, "Decompressed data size: %d", *data_size);
+
+  return decompressed_data;
+}
+
 static void
 handle_transform_m3u8(TSCont contp)
 {
@@ -400,6 +504,9 @@ handle_transform_m3u8(TSCont contp)
      transformation we might have to finish writing the transformed
      data to our output connection. */
   if (!TSVIOBufferGet(write_vio)) {
+    // TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
+    // TSVIOReenable(data->output_vio);
+    
     TSVIONBytesSet(data->output_vio, data->file_size);
     TSVIOReenable(data->output_vio);
 
@@ -454,23 +561,39 @@ handle_transform_m3u8(TSCont contp)
     TSDebug(PLUGIN_NAME, "Request prefix: %s", data->prefix);
     TSDebug(PLUGIN_NAME, "Request query string: %s", data->query_string);
     TSDebug(PLUGIN_NAME, "Write length: %ld", TSVIONDoneGet(write_vio));
-    int data_size = TSIOBufferReaderAvail(data->output_reader);
-    char file_data[data_size + 1];
+    int data_size = TSVIONDoneGet(write_vio);
+    unsigned char* file_data = (unsigned char*) malloc(data_size);
     /* Copy file data from buffer*/
     TSIOBufferReaderCopy(data->output_reader, file_data, data_size);
+    // bool is_gzip = is_gzip_data(file_data, data_size);
+    // if (is_gzip) {
+    //   file_data = unzip_file_data(file_data, &data_size);
+    //   TSDebug(PLUGIN_NAME, "Unzip data: %s", file_data);
+    //   TSDebug(PLUGIN_NAME, "Data size after unzip: %d", data_size);
+    // } 
+    
     TSDebug(PLUGIN_NAME, "File data: %s", file_data);
     
     /* Add token and prefix to every link in file*/
-    char* result = add_token_and_prefix(file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
+    char* result = add_token_and_prefix((char *) file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
     TSDebug(PLUGIN_NAME, "File size after transform: %d", data_size);
+    data_size = strlen(result);
+    TSDebug(PLUGIN_NAME, "Length of text: %d", data_size);
     TSDebug(PLUGIN_NAME, "File after transform: %s", result);
-    data->file_size = data_size;
+    // if (is_gzip) {
+    //   result = gzip_data(result, &data_size);
+    //   TSDebug(PLUGIN_NAME, "File after gzip: %s", result);
+    //   TSDebug(PLUGIN_NAME, "File size after gzip: %d", data_size);
+    // }
 
     /* Remove all data from reader and add content of file after tranform to reader*/
     TSIOBufferReaderConsume(data->output_reader, TSIOBufferReaderAvail(data->output_reader));
     TSIOBufferWrite(data->output_buffer, result, data_size);
     *(result) = '\0';
+    free(file_data);
     TSVIONBytesSet(data->output_vio, data_size);
+    data->file_size = data_size;
+    // TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
 
     TSVIOReenable(data->output_vio);
 
@@ -692,7 +815,7 @@ TSPluginInit(int argc, const char *argv[])
 
   info.plugin_name   = PLUGIN_NAME;
   info.vendor_name   = "VTNET";
-  TSDebug(PLUGIN_NAME, "Start m3u8 transform plugin");
+  TSDebug(PLUGIN_NAME, "Start m3u8 transform plugin v2");
 
   if (TSPluginRegister(&info) != TS_SUCCESS) {
     TSError("[%s] Plugin registration failed", PLUGIN_NAME);
