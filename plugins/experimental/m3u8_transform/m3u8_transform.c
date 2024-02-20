@@ -139,7 +139,7 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
     int scheme_length = 0;
     int path_length = 0;
     int query_param_length = 0;
-    int port_length = 0;
+    // int port_length = 0;
     TSMLoc url_loc;
     if (TS_SUCCESS == TSHttpHdrUrlGet(buf, loc, &url_loc)) {
       const char* path = TSUrlPathGet(buf, url_loc, &path_length);
@@ -174,10 +174,22 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       } else {
         *(prefix + scheme_length + 3 + host_length) = '\0';
       }
-      strncat(query_string, "?", 1);
-      strncat(query_string, query_param, query_param_length);
-      (*query_string_length) = (*query_string_length) + query_param_length + 1;
-      *(query_string + query_param_length + 1) = '\0';
+      char* token = strstr(query_param, "token=");
+      if (token != NULL) {
+        char* delimeter = strstr(token, "&");
+        if (delimeter == NULL) {
+          strncat(query_string, "?", 1);
+          strncat(query_string, query_param, query_param_length - (token - query_param + 8));
+          (*query_string_length) = (query_param_length) - (token - query_param + 8);
+          *(query_string + *query_string_length + 1) = '\0';
+        } else {
+          strncat(query_string, "?", 1);
+          strncat(query_string, query_param, (token - query_param ));
+          strncat(query_string, delimeter, query_param_length - (delimeter - query_param));
+          (*query_string_length) = (query_param_length) - (token - query_param + 8);
+          *(query_string + *query_string_length + 1) = '\0';
+        }
+      };
       
       
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
@@ -282,7 +294,7 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
 // TODO: Add token to subtag URL 
 char* 
 add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, char* query_string, int query_string_length, int* data_size) {
-    char buf[MAX_FILE_LENGTH + 1];
+    char buf[MAX_FILE_LENGTH + 1] = {'\0'};
     char* result = buf;
     const char *delimiter = "\n";
     char *line;
@@ -296,9 +308,9 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
       // If line not start with # 
       if (*(line) != '#') {
         if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL) || (strstr(line, ".m4s") != NULL) || (strstr(line, ".mp4") != NULL)) {
-          char url_store[MAX_URL_LEN];
+          char url_store[MAX_URL_LEN] = {'\0'};
           char* url = url_store;
-          unsigned char token_store[MAX_SIG_SIZE + 1];
+          unsigned char token_store[MAX_SIG_SIZE + 1] = {'\0'};
           unsigned char* token = token_store;
           unsigned int token_length = 0;
 
@@ -317,14 +329,14 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
           bool is_success = generate_token(url, token, &token_length);
           if (is_success) {
             strncat(result, "&token=", 7);
-            char token_string[2 * MAX_SIG_SIZE + 1];
+            char token_string[2 * MAX_SIG_SIZE + 1] = {'\0'};
             for (int i = 0; i < (int) token_length; i++) {
               sprintf(&(token_string[i * 2]), "%02x", token[i]);
             }
             TSDebug(PLUGIN_NAME, "Token of url %s: %s", url, token_string);
             strncat(result, token_string, token_length * 2);
           }
-          
+            
           url_store[0] = '\0';
           token_store[0] = '\0';
         } else {
@@ -336,9 +348,9 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
         if (uri != NULL) {
           char* next_quote = strstr(uri + 5, "\"");
           TSDebug(PLUGIN_NAME, "URI, next_quote of tag: %s, %s", uri, next_quote);
-          char url_store[MAX_URL_LEN];
+          char url_store[MAX_URL_LEN] = {'\0'};
           char* url = url_store;
-          unsigned char token_store[MAX_SIG_SIZE + 1];
+          unsigned char token_store[MAX_SIG_SIZE + 1] = {'\0'};
           unsigned char* token = token_store;
           unsigned int token_length = 0;
 
@@ -353,7 +365,7 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
           bool is_success = generate_token(url, token, &token_length);
           if (is_success) {
             strncat(result, "&token=", 7);
-            char token_string[2 * MAX_SIG_SIZE + 1];
+            char token_string[2 * MAX_SIG_SIZE + 1] = {'\0'};
             for (int i = 0; i < (int) token_length; i++) {
               sprintf(&(token_string[i * 2]), "%02x", token[i]);
             }
@@ -379,113 +391,113 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     return result;
 }
 
-bool 
-is_gzip_data(const unsigned char *buffer, size_t size) {
-    if (size < 2) {
-        return false; // Buffer is too small to contain gzip header
-    }
+// bool 
+// is_gzip_data(const unsigned char *buffer, size_t size) {
+//     if (size < 2) {
+//         return false; // Buffer is too small to contain gzip header
+//     }
 
-    if (buffer[0] != GZIP_MAGIC_0 || buffer[1] != GZIP_MAGIC_1) {
-        return false; // Magic number mismatch, not a gzip file
-    }
+//     if (buffer[0] != GZIP_MAGIC_0 || buffer[1] != GZIP_MAGIC_1) {
+//         return false; // Magic number mismatch, not a gzip file
+//     }
 
-    if (size < 3) {
-        return true; // Buffer contains gzip magic number only
-    }
+//     if (size < 3) {
+//         return true; // Buffer contains gzip magic number only
+//     }
 
-    if (buffer[2] != GZIP_METHOD) {
-        return false; // Compression method mismatch
-    }
+//     if (buffer[2] != GZIP_METHOD) {
+//         return false; // Compression method mismatch
+//     }
 
-    return true; // Likely a gzip file
-}
+//     return true; // Likely a gzip file
+// }
 
-static char*
-gzip_data(char* data, int* data_size) {
-  // Allocate memory for compressed data
-  size_t compressed_capacity = compressBound(*data_size);
-  unsigned char *compressed_data = (unsigned char *)malloc(compressed_capacity);
-  if (compressed_data == NULL) {
-      fprintf(stderr, "Failed to allocate memory\n");
-      return NULL;
-  }
+// static char*
+// gzip_data(char* data, int* data_size) {
+//   // Allocate memory for compressed data
+//   size_t compressed_capacity = compressBound(*data_size);
+//   unsigned char *compressed_data = (unsigned char *)malloc(compressed_capacity);
+//   if (compressed_data == NULL) {
+//       fprintf(stderr, "Failed to allocate memory\n");
+//       return NULL;
+//   }
 
-  // Compress data using zlib
-  z_stream stream;
-  memset(&stream, 0, sizeof(stream));
-  stream.next_in = (Bytef *)data;
-  stream.avail_in = *data_size;
-  stream.next_out = compressed_data;
-  stream.avail_out = compressed_capacity;
+//   // Compress data using zlib
+//   z_stream stream;
+//   memset(&stream, 0, sizeof(stream));
+//   stream.next_in = (Bytef *)data;
+//   stream.avail_in = *data_size;
+//   stream.next_out = compressed_data;
+//   stream.avail_out = compressed_capacity;
 
-  if (deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
-      fprintf(stderr, "Failed to initialize zlib\n");
-      free(compressed_data);
-      return NULL;
-  }
+//   if (deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+//       fprintf(stderr, "Failed to initialize zlib\n");
+//       free(compressed_data);
+//       return NULL;
+//   }
 
-  if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
-      fprintf(stderr, "Failed to compress data\n");
-      deflateEnd(&stream);
-      free(compressed_data);
-      return NULL;
-  }
+//   if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
+//       fprintf(stderr, "Failed to compress data\n");
+//       deflateEnd(&stream);
+//       free(compressed_data);
+//       return NULL;
+//   }
 
-  deflate(&stream, Z_FINISH);
-  deflateEnd(&stream);
+//   deflate(&stream, Z_FINISH);
+//   deflateEnd(&stream);
 
-  TSDebug(PLUGIN_NAME, "Compress data: %s", compressed_data);
-  TSDebug(PLUGIN_NAME, "Compress data size: %ld", stream.total_out);
-  *data_size = stream.total_out;
+//   TSDebug(PLUGIN_NAME, "Compress data: %s", compressed_data);
+//   TSDebug(PLUGIN_NAME, "Compress data size: %ld", stream.total_out);
+//   *data_size = stream.total_out;
 
-  // Free compressed data buffer
-  free(compressed_data);
+//   // Free compressed data buffer
+//   free(compressed_data);
 
-  return (char *)compressed_data;
-}
+//   return (char *)compressed_data;
+// }
 
-static unsigned char*
-unzip_file_data (unsigned char* compressed_data, int* data_size) {
-  // Allocate memory for decompressed data
-  int decompressed_size = MAX_FILE_LENGTH; // Adjust as needed
-  unsigned char *decompressed_data = (unsigned char *)malloc(decompressed_size);
+// static unsigned char*
+// unzip_file_data (unsigned char* compressed_data, int* data_size) {
+//   // Allocate memory for decompressed data
+//   int decompressed_size = MAX_FILE_LENGTH; // Adjust as needed
+//   unsigned char *decompressed_data = (unsigned char *)malloc(decompressed_size);
 
-  if (decompressed_data == NULL) {
-      fprintf(stderr, "Failed to allocate memory\n");
-      return NULL;
-  }
+//   if (decompressed_data == NULL) {
+//       fprintf(stderr, "Failed to allocate memory\n");
+//       return NULL;
+//   }
 
-  // Decompress data using zlib
-  z_stream stream;
-  memset(&stream, 0, sizeof(stream));
-  stream.next_in = compressed_data;
-  stream.avail_in = *data_size;
-  stream.next_out = decompressed_data;
-  stream.avail_out = decompressed_size;
+//   // Decompress data using zlib
+//   z_stream stream;
+//   memset(&stream, 0, sizeof(stream));
+//   stream.next_in = compressed_data;
+//   stream.avail_in = *data_size;
+//   stream.next_out = decompressed_data;
+//   stream.avail_out = decompressed_size;
 
-  if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
-      TSDebug(PLUGIN_NAME, "Failed to initialize zlib\n");
-      free(decompressed_data);
-      return NULL;
-  }
+//   if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
+//       TSDebug(PLUGIN_NAME, "Failed to initialize zlib\n");
+//       free(decompressed_data);
+//       return NULL;
+//   }
 
-  int ret = inflate(&stream, Z_FINISH);
-  if (ret != Z_STREAM_END) {
-      TSDebug(PLUGIN_NAME, "Failed to decompress data\n");
-      inflateEnd(&stream);
-      free(decompressed_data);
-      return NULL;
-  }
+//   int ret = inflate(&stream, Z_FINISH);
+//   if (ret != Z_STREAM_END) {
+//       TSDebug(PLUGIN_NAME, "Failed to decompress data\n");
+//       inflateEnd(&stream);
+//       free(decompressed_data);
+//       return NULL;
+//   }
 
-  inflateEnd(&stream);
+//   inflateEnd(&stream);
 
-  // Print decompressed data
-  TSDebug(PLUGIN_NAME, "Decompressed data: %s", decompressed_data);
-  *data_size = stream.total_out;
-  TSDebug(PLUGIN_NAME, "Decompressed data size: %d", *data_size);
+//   // Print decompressed data
+//   TSDebug(PLUGIN_NAME, "Decompressed data: %s", decompressed_data);
+//   *data_size = stream.total_out;
+//   TSDebug(PLUGIN_NAME, "Decompressed data size: %d", *data_size);
 
-  return decompressed_data;
-}
+//   return decompressed_data;
+// }
 
 static void
 handle_transform_m3u8(TSCont contp)
@@ -630,8 +642,31 @@ handle_transform_m3u8(TSCont contp)
   }
 }
 
+static bool
+transformable(TSHttpTxn txnp)
+{
+  TSMBuffer bufp;
+  TSMLoc hdr_loc;
+
+  if (TS_SUCCESS == TSHttpTxnServerRespGet(txnp, &bufp, &hdr_loc)) {
+    /*
+     *    We are only interested in "200 OK" responses.
+     */
+
+    if (TS_HTTP_STATUS_OK == TSHttpHdrStatusGet(bufp, hdr_loc)) {
+      ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc));
+      return true;
+    } else {
+      ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc));
+      return false;
+    }
+  }
+
+  return false; /* not a 200 */
+}
+
 static int
-add_token_transform(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
+transform_data(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
 {
   /* Check to see if the transformation has been closed by a call to
      TSVConnClose. */
@@ -641,6 +676,12 @@ add_token_transform(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
     return 0;
   } else {
     switch (event) {
+    // case TS_EVENT_HTTP_READ_RESPONSE_HDR: {
+    //   TSHttpTxn txnp = (TSHttpTxn) edata;
+    //   if (transformable(txnp)) {
+    //     TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, contp);
+    //   }
+    // } break;
     case TS_EVENT_ERROR: {
       TSVIO write_vio;
 
@@ -673,39 +714,15 @@ add_token_transform(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
   return 0;
 }
 
-static int
-transformable(TSHttpTxn txnp)
-{
-  TSMBuffer bufp;
-  TSMLoc hdr_loc;
-
-  if (TS_SUCCESS == TSHttpTxnServerRespGet(txnp, &bufp, &hdr_loc)) {
-    /*
-     *    We are only interested in "200 OK" responses.
-     */
-
-    if (TS_HTTP_STATUS_OK == TSHttpHdrStatusGet(bufp, hdr_loc)) {
-      ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc));
-      return 1;
-    } else {
-      ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc));
-      return 0;
-    }
-  }
-
-  return 0; /* not a 200 */
-}
-
-static void 
-transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
-  TSVConn connp;
-  // if (transformable(txnp)) {
-    connp = TSTransformCreate(add_token_transform, txnp);
-    MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
-    TSContDataSet(connp, data);
-    TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
-  // }
-}
+// static void 
+// transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
+//   TSVConn connp;
+//   connp = TSTransformCreate(transform_data, txnp);
+//   MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+//   TSContDataSet(connp, data);
+//   TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, connp);
+  
+// }
 
 static int
 transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
@@ -722,7 +739,11 @@ transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
 
   // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
   if (is_m3u8) {
-    transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
+    TSVConn connp;
+    connp = TSTransformCreate(transform_data, txnp);
+    MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+    TSContDataSet(connp, data);
+    TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
   }
   TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
 
