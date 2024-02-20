@@ -44,7 +44,7 @@
 
 #define ASSERT_SUCCESS(_x) TSAssert((_x) == TS_SUCCESS)
 #define MAX_FILE_LENGTH 100000
-#define MAX_URL_LEN 4096
+#define MAX_URL_LEN 1024
 #define MAX_REQ_LEN 8192
 #define MAX_KEY_LEN 256
 #define MAX_KEY_NUM 16
@@ -139,6 +139,7 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
     int scheme_length = 0;
     int path_length = 0;
     int query_param_length = 0;
+    int port_length = 0;
     TSMLoc url_loc;
     if (TS_SUCCESS == TSHttpHdrUrlGet(buf, loc, &url_loc)) {
       const char* path = TSUrlPathGet(buf, url_loc, &path_length);
@@ -152,18 +153,19 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       const char* scheme = TSUrlSchemeGet(buf, url_loc, &scheme_length);
       const char* query_param = TSUrlHttpQueryGet(buf, url_loc, &query_param_length);
       TSMLoc remap_loc;
-      prefix = strncat(prefix, scheme, scheme_length);
-      prefix = strncat(prefix, "://", 3);
+      strncat(prefix, scheme, scheme_length);
+      strncat(prefix, "://", 3);
       if (TS_SUCCESS == TSRemapFromUrlGet(txnp, &remap_loc)) {
         const char* host = TSUrlHostGet(buf, remap_loc, &host_length);
         prefix = strncat(prefix, host, host_length);
         ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, remap_loc));
       } else {
-        const char* host = TSUrlHostGet(buf, url_loc, &host_length);
-        prefix = strncat(prefix, host, host_length);
+        const char* host = TSHttpHdrHostGet(buf, loc, &host_length);
+        char* end_host = strstr(host, "\r");
+        prefix = strncat(prefix, host, end_host - host);
       }
-      prefix = strncat(prefix, "/", 1);
-      prefix = strncat(prefix, path, path_length);
+      strncat(prefix, "/", 1);
+      strncat(prefix, path, path_length);
       (*prefix_length) = (*prefix_length) + scheme_length + 3 + host_length + 1;
       char* file_name = strrchr(prefix, '/');
       if (file_name != NULL) {
@@ -172,8 +174,8 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       } else {
         *(prefix + scheme_length + 3 + host_length) = '\0';
       }
-      query_string = strncat(query_string, "?", 1);
-      query_string = strncat(query_string, query_param, query_param_length);
+      strncat(query_string, "?", 1);
+      strncat(query_string, query_param, query_param_length);
       (*query_string_length) = (*query_string_length) + query_param_length + 1;
       *(query_string + query_param_length + 1) = '\0';
       
@@ -202,7 +204,7 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
   TSDebug(PLUGIN_NAME, "Url: %s", url);
   // Skip scheme and initial forward slashes.
   const char *skip = strchr(url, ':');
-  if (!skip || skip[1] != '/' || skip[2] != '/') {
+  if (!skip || skip[1] != '/' || skip[2] != '/' || cp == NULL) {
     return false;
   }
   skip += 3;
@@ -291,15 +293,16 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     line = strtok(temp, delimiter);
     while (line != NULL) {
       TSDebug(PLUGIN_NAME, "Line: %s", line);
+      // If line not start with # 
       if (*(line) != '#') {
-        if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL)) {
+        if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL) || (strstr(line, ".m4s") != NULL) || (strstr(line, ".mp4") != NULL)) {
           char url_store[MAX_URL_LEN];
           char* url = url_store;
           unsigned char token_store[MAX_SIG_SIZE + 1];
           unsigned char* token = token_store;
           unsigned int token_length = 0;
 
-          // Generate token from url
+          // Generate url from line
           strncat(url, prefix, prefix_length);
           strcat(url, line);
           if (query_string_length > 0 && strstr(url, query_string) == NULL) {
@@ -309,19 +312,8 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
             strncat(url, query_string, query_string_length);
           }
 
-          // Add line to result (adding prefix, query_string, token if needed)
-          strncat(result, prefix, prefix_length);
-          (*data_size) = (*data_size) + prefix_length;
-          strcat(result, line);
-          if (query_string_length > 0 && strstr(line, query_string) == NULL) {
-            strncat(result, query_string, query_string_length);
-            (*data_size) = (*data_size) + query_string_length;
-          } else if (query_string_length > 0 && strstr(line, "?") == NULL) {
-            *(query_string) = '&';
-            strncat(result, query_string, query_string_length);
-            (*data_size) = (*data_size) + query_string_length;
-          }
-
+          // Add line with token to result (adding prefix, query_string, token if needed)
+          strcat(result, url);
           bool is_success = generate_token(url, token, &token_length);
           if (is_success) {
             strncat(result, "&token=", 7);
@@ -331,15 +323,50 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
             }
             TSDebug(PLUGIN_NAME, "Token of url %s: %s", url, token_string);
             strncat(result, token_string, token_length * 2);
-            (*data_size) = (*data_size) + MD5_SIG_SIZE * 2 + 7;
           }
           
           url_store[0] = '\0';
+          token_store[0] = '\0';
         } else {
           strcat(result, line);
         }
+      // If line contain URI tag
       } else {
-        strcat(result, line);
+        char* uri = strstr(line, "URI=\"");
+        if (uri != NULL) {
+          char* next_quote = strstr(uri + 5, "\"");
+          TSDebug(PLUGIN_NAME, "URI, next_quote of tag: %s, %s", uri, next_quote);
+          char url_store[MAX_URL_LEN];
+          char* url = url_store;
+          unsigned char token_store[MAX_SIG_SIZE + 1];
+          unsigned char* token = token_store;
+          unsigned int token_length = 0;
+
+          // Generate url from uri
+          strncat(url, prefix, prefix_length);
+          strncat(url, uri + 5, next_quote - uri - 5);
+          strncat(url, query_string, query_string_length);
+
+          // Add line with token to result (adding prefix, query_string, token if needed)
+          strncat(result, line, uri - line + 5);
+          strcat(result, url);
+          bool is_success = generate_token(url, token, &token_length);
+          if (is_success) {
+            strncat(result, "&token=", 7);
+            char token_string[2 * MAX_SIG_SIZE + 1];
+            for (int i = 0; i < (int) token_length; i++) {
+              sprintf(&(token_string[i * 2]), "%02x", token[i]);
+            }
+            TSDebug(PLUGIN_NAME, "Token of url %s: %s", url, token_string);
+            strncat(result, token_string, token_length * 2);
+          }
+          strcat(result, next_quote);
+          
+          url_store[0] = '\0';
+          token_store[0] = '\0';
+        } else {
+          strcat(result, line);
+        }
       }
       line = strtok(NULL, delimiter);
       if (line != NULL) {
@@ -672,43 +699,66 @@ transformable(TSHttpTxn txnp)
 static void 
 transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
   TSVConn connp;
-  
-  connp = TSTransformCreate(add_token_transform, txnp);
-  MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
-  TSContDataSet(connp, data);
-  TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+  // if (transformable(txnp)) {
+    connp = TSTransformCreate(add_token_transform, txnp);
+    MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+    TSContDataSet(connp, data);
+    TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+  // }
 }
 
 static int
 transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
 {
   TSHttpTxn txnp = (TSHttpTxn)edata;
-  TSDebug(PLUGIN_NAME, "Start transform");
+  TSDebug(PLUGIN_NAME, "Start get url");
+  char prefix_store[MAX_URL_LEN] = {'\0'};
+  char* prefix = prefix_store;
+  char query_string_store[MAX_URL_LEN] = {'\0'};
+  char* query_string = query_string_store;
+  int prefix_length = 0;
+  int query_string_length = 0;
+  bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
 
-  switch (event) {
-  case TS_EVENT_HTTP_READ_RESPONSE_HDR:
-    if (transformable(txnp)) {
-      char prefix_store[MAX_URL_LEN] = {'\0'};
-      char* prefix = prefix_store;
-      char query_string_store[MAX_URL_LEN] = {'\0'};
-      char* query_string = query_string_store;
-      int prefix_length = 0;
-      int query_string_length = 0;
-      bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
-
-      // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
-      if (is_m3u8) {
-        transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
-      }
-    }
-    TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
-    return 0;
-  default:
-    break;
+  // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
+  if (is_m3u8) {
+    transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
   }
+  TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
 
   return 0;
 }
+
+// static int
+// transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
+// {
+//   TSHttpTxn txnp = (TSHttpTxn)edata;
+//   TSDebug(PLUGIN_NAME, "Start transform");
+
+//   switch (event) {
+//   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
+//     if (transformable(txnp)) {
+//       char prefix_store[MAX_URL_LEN] = {'\0'};
+//       char* prefix = prefix_store;
+//       char query_string_store[MAX_URL_LEN] = {'\0'};
+//       char* query_string = query_string_store;
+//       int prefix_length = 0;
+//       int query_string_length = 0;
+//       bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
+
+//       // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
+//       if (is_m3u8) {
+//         transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
+//       }
+//     }
+//     TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
+//     return 0;
+//   default:
+//     break;
+//   }
+
+//   return 0;
+// }
 
 static int
 load(const char *filename)
@@ -832,7 +882,7 @@ TSPluginInit(int argc, const char *argv[])
     goto Lerror;
   }
 
-  TSHttpHookAdd(TS_HTTP_READ_RESPONSE_HDR_HOOK, TSContCreate(transform_plugin, NULL));
+  TSHttpHookAdd(TS_HTTP_PRE_REMAP_HOOK, TSContCreate(transform_plugin, NULL));
   return;
 
 Lerror:
