@@ -174,6 +174,9 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       } else {
         *(prefix + scheme_length + 3 + host_length) = '\0';
       }
+
+      // Just remove token from query param
+      // TODO: Abstract query param to other hook behind remap
       char* token = strstr(query_param, "token=");
       if (token != NULL) {
         char* delimeter = strstr(token, "&");
@@ -184,13 +187,12 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
           *(query_string + *query_string_length + 1) = '\0';
         } else {
           strncat(query_string, "?", 1);
-          strncat(query_string, query_param, (token - query_param ));
-          strncat(query_string, delimeter, query_param_length - (delimeter - query_param));
+          strncat(query_string, query_param, (token - query_param));
+          strncat(query_string, delimeter + 1, query_param_length - (delimeter - query_param) - 1);
           (*query_string_length) = (query_param_length) - (token - query_param + 8);
           *(query_string + *query_string_length + 1) = '\0';
         }
-      };
-      
+      };      
       
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
@@ -728,26 +730,36 @@ transform_data(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
 static int
 transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
 {
-  TSHttpTxn txnp = (TSHttpTxn)edata;
-  TSDebug(PLUGIN_NAME, "Start get url");
-  char prefix_store[MAX_URL_LEN] = {'\0'};
-  char* prefix = prefix_store;
-  char query_string_store[MAX_URL_LEN] = {'\0'};
-  char* query_string = query_string_store;
-  int prefix_length = 0;
-  int query_string_length = 0;
-  bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
+  switch (event) {
+  case TS_EVENT_HTTP_PRE_REMAP: 
+  {
+    TSHttpTxn txnp = (TSHttpTxn)edata;
+    TSDebug(PLUGIN_NAME, "Start get url");
+    char prefix_store[MAX_URL_LEN] = {'\0'};
+    char* prefix = prefix_store;
+    char query_string_store[MAX_URL_LEN] = {'\0'};
+    char* query_string = query_string_store;
+    int prefix_length = 0;
+    int query_string_length = 0;
+    bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
 
-  // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
-  if (is_m3u8) {
-    TSVConn connp;
-    connp = TSTransformCreate(transform_data, txnp);
-    MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
-    TSContDataSet(connp, data);
-    TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+    // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
+    if (is_m3u8) {
+      TSHttpTxnUntransformedRespCache(txnp, 1);
+      TSHttpTxnTransformedRespCache(txnp, 0);
+      TSVConn connp;
+      connp = TSTransformCreate(transform_data, txnp);
+      MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+      TSContDataSet(connp, data);
+      TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+    }
+    TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
+    return 0;
+  } break;
+  default:
+    break;
   }
-  TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
-
+  
   return 0;
 }
 
