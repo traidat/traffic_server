@@ -64,7 +64,7 @@ typedef struct {
   char* query_string;
   int prefix_length;
   int query_string_length;
-  int file_size;
+  int file_data;
 } MyData;
 
 struct config {
@@ -94,7 +94,7 @@ my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int 
   strcpy(data->prefix, prefix);
   data->query_string = malloc(query_string_length + 1);
   data->query_string_length = query_string_length;
-  data->file_size = 0;
+  data->file_data = 0;
   strcpy(data->query_string, query_string);
 
   return data;
@@ -241,15 +241,12 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
   char* query_params[sizeof(cfg->hash_query_param)];
   char* delimeterParam;
   for (int i = 0; i < cfg->paramNum; i++) {
-    TSDebug(PLUGIN_NAME, "Hash parameter %d: %s", i, cfg->hash_query_param[i]);
     query_params[i] = strstr(query, cfg->hash_query_param[i]);
     if (query_params[i] == NULL) {
       TSError("Missing hash parameter of %s", url);
       return false;
     }
     delimeterParam = strstr(query_params[i], "&");
-    TSDebug(PLUGIN_NAME, "Pointer query param: %s", query_params[i]);
-    TSDebug(PLUGIN_NAME, "Delimeter: %s", delimeterParam);
     if (i == cfg-> paramNum - 1) {
       strncat(signed_part, query_params[i], (delimeterParam - query_params[i]));
     } else {
@@ -257,18 +254,15 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
     }
   }
   // signed_part[strlen(signed_part)] = '\0';
-  TSDebug(PLUGIN_NAME, "cp: %s, query: %s, signed_part: %s", cp, query, signed_part);
   TSDebug(PLUGIN_NAME, "Signed string=\"%s\"", signed_part);
   switch (cfg->algorithm) {
   case USIG_HMAC_SHA1:
     HMAC(EVP_sha1(), (const unsigned char *)cfg->keys[cfg->knumber], strlen(cfg->keys[cfg->knumber]), (const unsigned char *)signed_part,
          strlen(signed_part), token, token_length);
     if ((*token_length) != SHA1_SIG_SIZE) {
-      TSDebug(PLUGIN_NAME, "sig_len: %d", (*token_length));
       TSError("Calculated sig len of %s !=  SHA1_SIG_SIZE !", url);
       return false;
     }
-    TSDebug(PLUGIN_NAME, "HmacSHA1 of signed_part %s: %s", signed_part, token);
     return true;
   case USIG_HMAC_MD5:
     HMAC(EVP_md5(), (const unsigned char *)cfg->keys[cfg->knumber], strlen(cfg->keys[cfg->knumber]), (const unsigned char *)signed_part,
@@ -276,11 +270,9 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
     // HMAC(EVP_md5(), (const unsigned char *)"px0KnwI_hxaS8uNzLOUZw6lVuBqVggJH", 32, (const unsigned char *) "10.61.129.17:8080/file/index.m3u8?timestamp=2526689025",
     //      54, token, token_length);
     if ((*token_length) != MD5_SIG_SIZE) {
-      TSDebug(PLUGIN_NAME, "sig_len: %d", (*token_length));
       TSError("Calculated sig len of %s !=  MD5_SIG_SIZE !", url);
       return false;
     }
-    TSDebug(PLUGIN_NAME, "HmacMD5 of signed_part %s: %s", signed_part, token);
     return true;
   default:
     TSError("Algorithm not supported: %d", cfg->algorithm);
@@ -299,8 +291,6 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     const char *delimiter = "\n";
     char *line;
     char* temp = strdup(file_data);
-    TSDebug(PLUGIN_NAME, "Prefix %s length %d", prefix, prefix_length);
-    TSDebug(PLUGIN_NAME, "Query string %s length %d", query_string, query_string_length);
 
     line = strtok(temp, delimiter);
     while (line != NULL) {
@@ -347,8 +337,8 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
         char* uri = strstr(line, "URI=\"");
         if (uri != NULL) {
           char* next_quote = strstr(uri + 5, "\"");
-          TSDebug(PLUGIN_NAME, "URI, next_quote of tag: %s, %s", uri, next_quote);
-          char url_store[MAX_URL_LEN] = {'\0'};
+          if (next_quote != NULL) {
+            char url_store[MAX_URL_LEN] = {'\0'};
           char* url = url_store;
           unsigned char token_store[MAX_SIG_SIZE + 1] = {'\0'};
           unsigned char* token = token_store;
@@ -376,6 +366,9 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
           
           url_store[0] = '\0';
           token_store[0] = '\0';
+          } else {
+            strcat(result, line);
+          }
         } else {
           strcat(result, line);
         }
@@ -546,7 +539,7 @@ handle_transform_m3u8(TSCont contp)
     // TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
     // TSVIOReenable(data->output_vio);
     
-    TSVIONBytesSet(data->output_vio, data->file_size);
+    TSVIONBytesSet(data->output_vio, data->file_data);
     TSVIOReenable(data->output_vio);
 
     return;
@@ -556,16 +549,25 @@ handle_transform_m3u8(TSCont contp)
      transform plugin this is also the amount of data we have left
      to write to the output connection. */
   towrite = TSVIONTodoGet(write_vio);
-  if (towrite > 0) {
-    /* The amount of data left to read needs to be truncated by
-       the amount of data actually in the read buffer. */
-    int64_t avail = TSIOBufferReaderAvail(TSVIOReaderGet(write_vio));
-    if (towrite > avail) {
-      towrite = avail;
-    }
-    if (towrite > 0) {
-      /* Copy the data from the read buffer to the output buffer. */
-      TSIOBufferCopy(TSVIOBufferGet(data->output_vio), TSVIOReaderGet(write_vio), towrite, 0);
+  // unsigned char* file_data = (unsigned char*) malloc(towrite + 1);
+  unsigned char* file_data = (unsigned char*) malloc(towrite + 1);
+  TSIOBufferReaderCopy(TSVIOReaderGet(write_vio), file_data, towrite);
+  *(file_data + towrite) = '\0';
+  TSDebug(PLUGIN_NAME, "Data length: %ld", towrite);
+  TSDebug(PLUGIN_NAME, "Data file: %s", file_data);
+  // free(file_data);
+  // if (towrite > 0) {
+  //   /* The amount of data left to read needs to be truncated by
+  //      the amount of data actually in the read buffer. */
+  //   int64_t avail = TSIOBufferReaderAvail(TSVIOReaderGet(write_vio));
+  //   TSDebug(PLUGIN_NAME, "Towrite: %ld", towrite);
+  //   TSDebug(PLUGIN_NAME, "Avail: %ld", avail);
+  //   if (towrite > avail) {
+  //     towrite = avail;
+  //   }
+  //   if (towrite > 0) {
+  //     /* Copy the data from the read buffer to the output buffer. */
+  //     TSIOBufferCopy(data->output_buffer, TSVIOReaderGet(write_vio), towrite, 0);
 
       /* Tell the read buffer that we have read the data and are no
          longer interested in it. */
@@ -573,25 +575,25 @@ handle_transform_m3u8(TSCont contp)
 
       /* Modify the write VIO to reflect how much data we've
          completed. */
-      TSVIONDoneSet(write_vio, TSVIONDoneGet(write_vio) + towrite);
-    }
-  }
+      TSVIONDoneSet(write_vio, towrite);
+  //   }
+  // }
 
   /* Now we check the write VIO to see if there is data left to
      read. */
-  if (TSVIONTodoGet(write_vio) > 0) {
-    if (towrite > 0) {
-      /* If there is data left to read, then we reenable the output
-         connection by reenabling the output VIO. This will wakeup
-         the output connection and allow it to consume data from the
-         output buffer. */
-      TSVIOReenable(data->output_vio);
+  // if (TSVIONTodoGet(write_vio) > 0) {
+  //   if (towrite > 0) {
+  //     /* If there is data left to read, then we reenable the output
+  //        connection by reenabling the output VIO. This will wakeup
+  //        the output connection and allow it to consume data from the
+  //        output buffer. */
+  //     TSVIOReenable(data->output_vio);
 
-      /* Call back the write VIO continuation to let it know that we
-         are ready for more data. */
-      TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_READY, write_vio);
-    }
-  } else {
+  //     /* Call back the write VIO continuation to let it know that we
+  //        are ready for more data. */
+  //     TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_READY, write_vio);
+  //   }
+  // } else {
     /* If there is no data left to read, then we modify the output
        VIO to reflect how much data the output connection should
        expect. This allows the output connection to know when it
@@ -600,22 +602,21 @@ handle_transform_m3u8(TSCont contp)
     TSDebug(PLUGIN_NAME, "Request prefix: %s", data->prefix);
     TSDebug(PLUGIN_NAME, "Request query string: %s", data->query_string);
     TSDebug(PLUGIN_NAME, "Write length: %ld", TSVIONDoneGet(write_vio));
+    TSDebug(PLUGIN_NAME, "Read length: %ld",TSIOBufferReaderAvail(data->output_reader));
     int data_size = TSVIONDoneGet(write_vio);
-    unsigned char* file_data = (unsigned char*) malloc(data_size);
+    
     /* Copy file data from buffer*/
-    TSIOBufferReaderCopy(data->output_reader, file_data, data_size);
+    // TSIOBufferReaderCopy(data->output_reader, file_data, data_size);
+    // TSDebug(PLUGIN_NAME, "File data: %s", file_data);
     // bool is_gzip = is_gzip_data(file_data, data_size);
     // if (is_gzip) {
     //   file_data = unzip_file_data(file_data, &data_size);
     //   TSDebug(PLUGIN_NAME, "Unzip data: %s", file_data);
     //   TSDebug(PLUGIN_NAME, "Data size after unzip: %d", data_size);
     // } 
-    
-    TSDebug(PLUGIN_NAME, "File data: %s", file_data);
-    
+        
     /* Add token and prefix to every link in file*/
     char* result = add_token_and_prefix((char *) file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
-    TSDebug(PLUGIN_NAME, "File size after transform: %d", data_size);
     data_size = strlen(result);
     TSDebug(PLUGIN_NAME, "Length of text: %d", data_size);
     TSDebug(PLUGIN_NAME, "File after transform: %s", result);
@@ -631,7 +632,7 @@ handle_transform_m3u8(TSCont contp)
     *(result) = '\0';
     free(file_data);
     TSVIONBytesSet(data->output_vio, data_size);
-    data->file_size = data_size;
+    data->file_data = data_size;
     // TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
 
     TSVIOReenable(data->output_vio);
@@ -639,7 +640,7 @@ handle_transform_m3u8(TSCont contp)
     /* Call back the write VIO continuation to let it know that wek
        have completed the write operation. */
     TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_COMPLETE, write_vio);
-  }
+  // }
 }
 
 static bool
