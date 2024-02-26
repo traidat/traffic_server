@@ -61,6 +61,11 @@ struct config {
   int pristine_url_flag;
   char *sig_anchor;
   bool ignore_expiry;
+  char hash_query_param[MAX_HASH_QUERY_PARAM_NUM][MAX_HASH_QUERY_LEN];
+  int paramNum;
+  char use_parts[MAX_USE_PARTS_LEN];
+  int algorithm;  
+  int knumber;
 };
 
 static void
@@ -135,6 +140,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
   char line[300];
   int line_no = 0;
   int keynum;
+  int paramNum = 0;
   bool eat_comment = false;
 
   cfg = TSmalloc(sizeof(struct config));
@@ -241,6 +247,22 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
         cfg->pristine_url_flag = 1;
         TSDebug(PLUGIN_NAME, "Pristine URLs (from config) will be used");
       }
+    } else if (strncmp(line, "hash_query_param", 16) == 0) {
+      char* param;
+      while ((param = strtok_r(value, ",", &param))) {
+        TSDebug(PLUGIN_NAME, "Param number %d: %s", paramNum, param);
+        snprintf(&cfg->hash_query_param[paramNum][0], MAX_HASH_QUERY_LEN, "%s", param);
+        value = value + strlen(param) + 1;
+        paramNum = paramNum + 1;
+      }
+      cfg->paramNum = paramNum;
+    } else if (strncmp(line, "use_parts", 9) == 0) {
+      snprintf(&cfg->use_parts[0], MAX_USE_PARTS_LEN, "%s", value);
+      TSDebug(PLUGIN_NAME, "Use_part: %s", cfg->use_parts);
+    } else if (strncmp(line, "algorithm", 9) == 0) {
+      cfg->algorithm = atoi(value);
+    } else if (strncmp(line, "knumber", 1) == 0) {
+      cfg->knumber = atoi(value);
     } else {
       TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
@@ -320,35 +342,39 @@ getAppQueryString(const char *query_string, int query_length)
   p = buf;
 
   TSDebug(PLUGIN_NAME, "query_string: %s, query_length: %d", query_string, query_length);
-
+  char result[MAX_QUERY_LEN];
+  memset(result, '\0', sizeof(result));
+  TSDebug(PLUGIN_NAME, "Result %s", result);
   do {
-    switch (*p) {
-    case 'A':
-    case 'C':
-    case 'E':
-    case 'K':
-    case 'P':
-    case 'S':
+    char* token = strstr(p, SIG_QSTRING "=");
+    if (token != NULL) {
+      TSDebug(PLUGIN_NAME, "Token %s", token);
       done = 1;
-      if ((p > buf) && (*(p - 1) == '&')) {
-        *(p - 1) = '\0';
+      char* delimeter = strchr(token, '&');
+      TSDebug(PLUGIN_NAME, "Delimeter %s", delimeter);
+      TSDebug(PLUGIN_NAME, "P %s", p);
+      if (token != p) {
+        strncat(result, p, (token - p) - 1);
+        if (delimeter != NULL) {
+          strcat(result, delimeter);
+        }
       } else {
-        (*p = '\0');
+        if (delimeter != NULL) {
+          delimeter++;
+          strcat(result, delimeter);
+        }
       }
-      break;
-    default:
-      p = strchr(p, '&');
-      if (p == NULL) {
-        done = 1;
-      } else {
-        p++;
-      }
-      break;
+    } else {
+      TSDebug(PLUGIN_NAME, "P %s", p);
+      done = 1;
+      strcpy(result, p);
     }
   } while (!done);
 
-  if (strlen(buf) > 0) {
-    p = TSstrdup(buf);
+  TSDebug(PLUGIN_NAME, "Result %s", result);
+  if (strlen(result) > 0) {
+    p = TSstrdup(result);
+    memset(result, '\0', sizeof(result));
     return p;
   } else {
     return NULL;
@@ -609,7 +635,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   const char *query = strchr(url, '?');
 
   // check for path params.
-  if (query == NULL || strstr(query, "E=") == NULL) {
+  if (query == NULL || strstr(query, "timestamp=") == NULL) {
     char *const parsed = urlParse(url, cfg->sig_anchor, new_path, 8192, path_params, 8192);
     if (parsed == NULL) {
       err_log(url, "Unable to parse/decode new url path parameters");
@@ -702,7 +728,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
       }
       TSDebug(PLUGIN_NAME, "Exp: %" PRIu64, expiration);
     } else {
-      err_log(url, "Expiration query string not found");
+      err_log(url, "Timestamp query string not found");
       goto deny;
     }
   }
@@ -714,8 +740,12 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     // The check for a valid algorithm is later.
     TSDebug(PLUGIN_NAME, "Algorithm: %d", algorithm);
   } else {
-    err_log(url, "Algorithm query string not found");
-    goto deny;
+    if (cfg->algorithm != 0) {
+      algorithm = cfg->algorithm;
+    } else {
+      algorithm = 2;
+    }
+    TSDebug(PLUGIN_NAME, "Algorithm default: %d", algorithm);
   }
   // Key index
   cp = strstr(query, KIN_QSTRING "=");
@@ -728,8 +758,12 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     }
     TSDebug(PLUGIN_NAME, "Key Index: %d", keyindex);
   } else {
-    err_log(url, "KeyIndex query string not found");
-    goto deny;
+    keyindex = cfg->knumber;
+    if (keyindex < 0 || keyindex >= MAX_KEY_NUM || 0 == cfg->keys[keyindex][0]) {
+      err_log(url, "Invalid key index");
+      goto deny;
+    }
+    TSDebug(PLUGIN_NAME, "Key Index default: %d", keyindex);
   }
   // Parts
   const char *parts = NULL;
@@ -743,9 +777,19 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     } else {
       TSDebug(PLUGIN_NAME, "Parts: %s", parts);
     }
-  } else {
-    err_log(url, "PartsSigned query string not found");
-    goto deny;
+  } else { 
+    if (cfg->use_parts != NULL) {
+      TSDebug(PLUGIN_NAME, "Use parts: %s", cfg->use_parts);
+      parts = cfg->use_parts;
+    } else {
+      parts = "0011";
+    }
+    has_path_params == false ? (cp = strstr(parts, "&")) : (cp = strstr(parts, ";"));
+    if (cp) {
+      TSDebug(PLUGIN_NAME, "Parts default: %.*s", (int)(cp - parts), parts);
+    } else {
+      TSDebug(PLUGIN_NAME, "Parts default: %s", parts);
+    }
   }
   // And finally, the sig (has to be last)
   const char *signature = NULL;
@@ -755,11 +799,11 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     signature = cp;
     if ((algorithm == USIG_HMAC_SHA1 && strlen(signature) < SHA1_SIG_SIZE) ||
         (algorithm == USIG_HMAC_MD5 && strlen(signature) < MD5_SIG_SIZE)) {
-      err_log(url, "Signature query string too short (< 20)");
+      err_log(url, "Token query string too short (< 20)");
       goto deny;
     }
   } else {
-    err_log(url, "Signature query string not found");
+    err_log(url, "Token query string not found");
     goto deny;
   }
 
@@ -777,6 +821,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   skip += 3;
   memcpy(urltokstr, skip, cp - skip);
   char *strtok_r_p;
+
   const char *part = strtok_r(urltokstr, "/", &strtok_r_p);
   while (part != NULL) {
     if (parts[j] == '1') {
@@ -792,10 +837,28 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
 
   // chop off the last /, replace with '?' or ';' as appropriate.
   has_path_params == false ? (signed_part[strlen(signed_part) - 1] = '?') : (signed_part[strlen(signed_part) - 1] = '\0');
+  char* query_params[sizeof(cfg->hash_query_param)];
+  char* delimeterParam;
+  for (int i = 0; i < cfg->paramNum; i++) {
+    TSDebug(PLUGIN_NAME, "Hash parameter %d: %s", i, cfg->hash_query_param[i]);
+    query_params[i] = strstr(query, cfg->hash_query_param[i]);
+    if (query_params[i] == NULL) {
+      err_log(url, "Missing hash parameter");
+      goto deny;
+    }
+    delimeterParam = strstr(query_params[i], "&");
+    TSDebug(PLUGIN_NAME, "Pointer query param: %s", query_params[i]);
+    TSDebug(PLUGIN_NAME, "Delimeter: %s", delimeterParam);
+    if (i == cfg-> paramNum - 1) {
+      strncat(signed_part, query_params[i], (delimeterParam - query_params[i]));
+    } else {
+      strncat(signed_part, query_params[i], (delimeterParam - query_params[i]) + 1);
+    }
+    TSDebug(PLUGIN_NAME, "Signed string: %s", signed_part);
+  }
   cp = strstr(query, SIG_QSTRING "=");
   TSDebug(PLUGIN_NAME, "cp: %s, query: %s, signed_part: %s", cp, query, signed_part);
-  strncat(signed_part, query, (cp - query) + strlen(SIG_QSTRING) + 1);
-
+  /* strncat(signed_part, query, (cp - query) + strlen(SIG_QSTRING) + 1); */
   TSDebug(PLUGIN_NAME, "Signed string=\"%s\"", signed_part);
 
   /* calculate the expected the signature with the right algorithm */
@@ -872,12 +935,13 @@ allow:
   if (url != current_url) {
     TSfree((void *)url);
   }
-
+  TSDebug(PLUGIN_NAME, "Current URL %s", current_url);
   const char *current_query = strchr(current_url, '?');
   const char *app_qry       = NULL;
   if (current_query != NULL) {
     current_query++;
     app_qry = getAppQueryString(current_query, strlen(current_query));
+    TSDebug(PLUGIN_NAME, "Current query: %s", app_qry);
   }
   TSDebug(PLUGIN_NAME, "has_path_params: %d", has_path_params);
   if (has_path_params) {
