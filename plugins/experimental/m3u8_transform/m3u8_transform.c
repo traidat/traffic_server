@@ -29,11 +29,11 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <zlib.h>
+#include <ts/ts.h>
+#include <ts/remap.h>
 
 #include "ts/ts.h"
 #include "tscore/ink_defs.h"
-
-
 
 #define PLUGIN_NAME "m3u8_transform"
 #define USIG_HMAC_SHA1 1
@@ -65,6 +65,7 @@ typedef struct {
   int prefix_length;
   int query_string_length;
   int file_data;
+  struct config* config;
 } MyData;
 
 struct config {
@@ -76,10 +77,8 @@ struct config {
   int knumber;
 };
 
-struct config *cfg;
-
 static MyData *
-my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int query_string_length)
+my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int query_string_length, struct config* cfg)
 {
   MyData *data;
 
@@ -96,6 +95,7 @@ my_data_alloc_with_url(char* prefix, int prefix_length, char* query_string, int 
   data->query_string_length = query_string_length;
   data->file_data = 0;
   strcpy(data->query_string, query_string);
+  data->config = cfg;
 
   return data;
 }
@@ -120,12 +120,33 @@ my_data_destroy(MyData *data)
 static void
 free_cfg(struct config *cfg)
 {
-  TSDebug(PLUGIN_NAME, "Cleaning up");
+  TSDebug(PLUGIN_NAME, "Cleaning up config");
   TSfree(cfg->use_parts);
 
   TSfree(cfg);
 }
 
+
+char *
+strnstr(const char *s, const char *find, size_t slen)
+{
+  char c, sc;
+  size_t len;
+
+  if ((c = *find++) != '\0') {
+      len = strlen(find);
+      do {
+          do {
+              if (slen-- < 1 || (sc = *s++) == '\0')
+                  return (NULL);
+          } while (sc != c);
+          if (len > slen)
+              return (NULL);
+      } while (strncmp(s, find, len) != 0);
+      s--;
+  }
+  return ((char *)s);
+}
 
 // Verify request is m3u8 file and get prefix and query_string of request URL
 // TODO: Verify host is IP or domain, port is 80, 443 or not
@@ -144,11 +165,13 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
     if (TS_SUCCESS == TSHttpHdrUrlGet(buf, loc, &url_loc)) {
       const char* path = TSUrlPathGet(buf, url_loc, &path_length);
       // TODO: Use regex to verify request m3u8 file. Now just check contain .m3u8
-      if (strstr(path, ".m3u8") == NULL) {
+      if (path == NULL || strnstr(path, ".m3u8", path_length + 1) == NULL) {
         ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
         ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+        TSDebug(PLUGIN_NAME, "Path %s will not transform", path);
         return false;
       }
+      TSDebug(PLUGIN_NAME, "Path %s will transform", path);
 
       const char* scheme = TSUrlSchemeGet(buf, url_loc, &scheme_length);
       const char* query_param = TSUrlHttpQueryGet(buf, url_loc, &query_param_length);
@@ -157,7 +180,14 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
       strncat(prefix, "://", 3);
       if (TS_SUCCESS == TSRemapFromUrlGet(txnp, &remap_loc)) {
         const char* host = TSUrlHostGet(buf, remap_loc, &host_length);
+        int port = TSUrlRawPortGet(buf, remap_loc);
         prefix = strncat(prefix, host, host_length);
+        if (port > 0) {
+          prefix = strncat(prefix, ":", 1);
+          char buf[sizeof(int)*3+2];
+          snprintf(buf, sizeof buf, "%d", port);
+          prefix = strcat(prefix, buf);
+        }
         ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, remap_loc));
       } else {
         const char* host = TSHttpHdrHostGet(buf, loc, &host_length);
@@ -175,24 +205,30 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
         *(prefix + scheme_length + 3 + host_length) = '\0';
       }
 
+      strncat(query_string, "?", 1);
+      strncat(query_string, query_param, query_param_length);
+      (*query_string_length) = (query_param_length);
+
       // Just remove token from query param
-      // TODO: Abstract query param to other hook behind remap
-      char* token = strstr(query_param, "token=");
-      if (token != NULL) {
-        char* delimeter = strstr(token, "&");
-        if (delimeter == NULL) {
-          strncat(query_string, "?", 1);
-          strncat(query_string, query_param, query_param_length - (token - query_param + 8));
-          (*query_string_length) = (query_param_length) - (token - query_param + 8);
-          *(query_string + *query_string_length + 1) = '\0';
-        } else {
-          strncat(query_string, "?", 1);
-          strncat(query_string, query_param, (token - query_param));
-          strncat(query_string, delimeter + 1, query_param_length - (delimeter - query_param) - 1);
-          (*query_string_length) = (query_param_length) - (token - query_param + 8);
-          *(query_string + *query_string_length + 1) = '\0';
-        }
-      };      
+      // TODO: Remove all param not used by origin
+      // if (query_param != NULL) {
+      //   char* token = strstr(query_param, "token=");
+      //     if (token != NULL) {
+      //     char* delimeter = strstr(token, "&");
+      //     if (delimeter == NULL) {
+      //       strncat(query_string, "?", 1);
+      //       strncat(query_string, query_param, query_param_length - (token - query_param + 8));
+      //       (*query_string_length) = (query_param_length) - (token - query_param + 8);
+      //       *(query_string + *query_string_length + 1) = '\0';
+      //     } else {
+      //       strncat(query_string, "?", 1);
+      //       strncat(query_string, query_param, (token - query_param));
+      //       strncat(query_string, delimeter + 1, query_param_length - (delimeter - query_param) - 1);
+      //       (*query_string_length) = (query_param_length) - (token - query_param + 8);
+      //       *(query_string + *query_string_length + 1) = '\0';
+      //     }
+      //   }
+      // }
       
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
@@ -209,7 +245,7 @@ verify_request_url(TSHttpTxn txnp, char* prefix, int* prefix_length, char* query
 }
 
 bool
-generate_token(char* url, unsigned char* token, unsigned int* token_length) {
+generate_token(char* url, struct config* cfg, unsigned char* token, unsigned int* token_length) {
   const char *query = strchr(url, '?');
   char signed_part[MAX_URL_LEN] = {'\0'};
   char urltokstr[MAX_URL_LEN] = {'\0'};
@@ -287,7 +323,8 @@ generate_token(char* url, unsigned char* token, unsigned int* token_length) {
 // Add prefix cache domain and token to every link inside m3u8 file
 // TODO: Add token to subtag URL 
 char* 
-add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, char* query_string, int query_string_length, int* data_size) {
+add_token_and_prefix(const char *file_data, struct config* cfg, char* prefix, int prefix_length, char* query_string, int query_string_length, int* data_size) {
+    *data_size = 0;
     char buf[MAX_FILE_LENGTH + 1] = {'\0'};
     char* result = buf;
     const char *delimiter = "\n";
@@ -296,8 +333,9 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
 
     line = strtok(temp, delimiter);
     while (line != NULL) {
-      TSDebug(PLUGIN_NAME, "Line: %s", line);
+      TSDebug(PLUGIN_NAME, "LINE: %s (%d)", line, (int)strlen(line));
       // If line not start with # 
+      data_size = data_size + 1;
       if (*(line) != '#') {
         if (strstr(line, ".ts") != NULL || (strstr(line, ".m3u8") != NULL) || (strstr(line, ".m4s") != NULL) || (strstr(line, ".mp4") != NULL)) {
           char url_store[MAX_URL_LEN] = {'\0'};
@@ -318,7 +356,7 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
 
           // Add line with token to result (adding prefix, query_string, token if needed)
           strcat(result, url);
-          bool is_success = generate_token(url, token, &token_length);
+          bool is_success = generate_token(url, cfg, token, &token_length);
           if (is_success) {
             strncat(result, "&token=", 7);
             char token_string[2 * MAX_SIG_SIZE + 1] = {'\0'};
@@ -354,7 +392,7 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
           // Add line with token to result (adding prefix, query_string, token if needed)
           strncat(result, line, uri - line + 5);
           strcat(result, url);
-          bool is_success = generate_token(url, token, &token_length);
+          bool is_success = generate_token(url, cfg, token, &token_length);
           if (is_success) {
             strncat(result, "&token=", 7);
             char token_string[2 * MAX_SIG_SIZE + 1] = {'\0'};
@@ -386,114 +424,6 @@ add_token_and_prefix(const char *file_data, char* prefix, int prefix_length, cha
     return result;
 }
 
-// bool 
-// is_gzip_data(const unsigned char *buffer, size_t size) {
-//     if (size < 2) {
-//         return false; // Buffer is too small to contain gzip header
-//     }
-
-//     if (buffer[0] != GZIP_MAGIC_0 || buffer[1] != GZIP_MAGIC_1) {
-//         return false; // Magic number mismatch, not a gzip file
-//     }
-
-//     if (size < 3) {
-//         return true; // Buffer contains gzip magic number only
-//     }
-
-//     if (buffer[2] != GZIP_METHOD) {
-//         return false; // Compression method mismatch
-//     }
-
-//     return true; // Likely a gzip file
-// }
-
-// static char*
-// gzip_data(char* data, int* data_size) {
-//   // Allocate memory for compressed data
-//   size_t compressed_capacity = compressBound(*data_size);
-//   unsigned char *compressed_data = (unsigned char *)malloc(compressed_capacity);
-//   if (compressed_data == NULL) {
-//       fprintf(stderr, "Failed to allocate memory\n");
-//       return NULL;
-//   }
-
-//   // Compress data using zlib
-//   z_stream stream;
-//   memset(&stream, 0, sizeof(stream));
-//   stream.next_in = (Bytef *)data;
-//   stream.avail_in = *data_size;
-//   stream.next_out = compressed_data;
-//   stream.avail_out = compressed_capacity;
-
-//   if (deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
-//       fprintf(stderr, "Failed to initialize zlib\n");
-//       free(compressed_data);
-//       return NULL;
-//   }
-
-//   if (deflate(&stream, Z_FINISH) != Z_STREAM_END) {
-//       fprintf(stderr, "Failed to compress data\n");
-//       deflateEnd(&stream);
-//       free(compressed_data);
-//       return NULL;
-//   }
-
-//   deflate(&stream, Z_FINISH);
-//   deflateEnd(&stream);
-
-//   TSDebug(PLUGIN_NAME, "Compress data: %s", compressed_data);
-//   TSDebug(PLUGIN_NAME, "Compress data size: %ld", stream.total_out);
-//   *data_size = stream.total_out;
-
-//   // Free compressed data buffer
-//   free(compressed_data);
-
-//   return (char *)compressed_data;
-// }
-
-// static unsigned char*
-// unzip_file_data (unsigned char* compressed_data, int* data_size) {
-//   // Allocate memory for decompressed data
-//   int decompressed_size = MAX_FILE_LENGTH; // Adjust as needed
-//   unsigned char *decompressed_data = (unsigned char *)malloc(decompressed_size);
-
-//   if (decompressed_data == NULL) {
-//       fprintf(stderr, "Failed to allocate memory\n");
-//       return NULL;
-//   }
-
-//   // Decompress data using zlib
-//   z_stream stream;
-//   memset(&stream, 0, sizeof(stream));
-//   stream.next_in = compressed_data;
-//   stream.avail_in = *data_size;
-//   stream.next_out = decompressed_data;
-//   stream.avail_out = decompressed_size;
-
-//   if (inflateInit2(&stream, 16 + MAX_WBITS) != Z_OK) {
-//       TSDebug(PLUGIN_NAME, "Failed to initialize zlib\n");
-//       free(decompressed_data);
-//       return NULL;
-//   }
-
-//   int ret = inflate(&stream, Z_FINISH);
-//   if (ret != Z_STREAM_END) {
-//       TSDebug(PLUGIN_NAME, "Failed to decompress data\n");
-//       inflateEnd(&stream);
-//       free(decompressed_data);
-//       return NULL;
-//   }
-
-//   inflateEnd(&stream);
-
-//   // Print decompressed data
-//   TSDebug(PLUGIN_NAME, "Decompressed data: %s", decompressed_data);
-//   *data_size = stream.total_out;
-//   TSDebug(PLUGIN_NAME, "Decompressed data size: %d", *data_size);
-
-//   return decompressed_data;
-// }
-
 static void
 handle_transform_m3u8(TSCont contp)
 {
@@ -518,7 +448,7 @@ handle_transform_m3u8(TSCont contp)
   data = TSContDataGet(contp);
   if (!data) {
     towrite = TSVIONBytesGet(write_vio);
-    data                = my_data_alloc_with_url("", 0,"", 0);
+    data                = my_data_alloc_with_url("", 0,"", 0, NULL);
     data->output_buffer = TSIOBufferCreate();
     data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
     data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, towrite);
@@ -556,7 +486,7 @@ handle_transform_m3u8(TSCont contp)
   TSIOBufferReaderCopy(TSVIOReaderGet(write_vio), file_data, towrite);
   *(file_data + towrite) = '\0';
   TSDebug(PLUGIN_NAME, "Data length: %ld", towrite);
-  TSDebug(PLUGIN_NAME, "Data file: %s", file_data);
+  TSDebug(PLUGIN_NAME, "Data file: %s and data length: %ld", file_data, strlen(file_data));
   // free(file_data);
   // if (towrite > 0) {
   //   /* The amount of data left to read needs to be truncated by
@@ -618,8 +548,8 @@ handle_transform_m3u8(TSCont contp)
     // } 
         
     /* Add token and prefix to every link in file*/
-    char* result = add_token_and_prefix((char *) file_data, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
-    data_size = strlen(result);
+    char* result = add_token_and_prefix((char *) file_data, data->config, data-> prefix, data -> prefix_length, data-> query_string, data->query_string_length, &data_size);
+    data_size = data_size + strlen(result);
     TSDebug(PLUGIN_NAME, "Length of text: %d", data_size);
     TSDebug(PLUGIN_NAME, "File after transform: %s", result);
     // if (is_gzip) {
@@ -652,11 +582,10 @@ transformable(TSHttpTxn txnp)
   TSMLoc hdr_loc;
 
   if (TS_SUCCESS == TSHttpTxnServerRespGet(txnp, &bufp, &hdr_loc)) {
-    /*
-     *    We are only interested in "200 OK" responses.
-     */
+    TSHttpStatus status = TSHttpHdrStatusGet(bufp, hdr_loc);
+    TSDebug(PLUGIN_NAME, "Status code of request: %d", status);
 
-    if (TS_HTTP_STATUS_OK == TSHttpHdrStatusGet(bufp, hdr_loc)) {
+    if (TS_HTTP_STATUS_OK == status || TS_HTTP_STATUS_PARTIAL_CONTENT == status) {
       ASSERT_SUCCESS(TSHandleMLocRelease(bufp, TS_NULL_MLOC, hdr_loc));
       return true;
     } else {
@@ -717,92 +646,92 @@ transform_data(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
   return 0;
 }
 
-// static void 
-// transform_m3u8(TSHttpTxn txnp, char* prefix, int prefix_length, char* query_string, int query_string_length) {
-//   TSVConn connp;
-//   connp = TSTransformCreate(transform_data, txnp);
-//   MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
-//   TSContDataSet(connp, data);
-//   TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, connp);
-  
-// }
-
 static int
-transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
-{
+transform_m3u8_if_needed(TSCont contp, TSEvent event, void *edata) {
+  TSHttpTxn txnp = (TSHttpTxn) edata;
   switch (event) {
-  case TS_EVENT_HTTP_PRE_REMAP: 
-  {
-    TSHttpTxn txnp = (TSHttpTxn)edata;
-    TSDebug(PLUGIN_NAME, "Start get url");
-    char prefix_store[MAX_URL_LEN] = {'\0'};
-    char* prefix = prefix_store;
-    char query_string_store[MAX_URL_LEN] = {'\0'};
-    char* query_string = query_string_store;
-    int prefix_length = 0;
-    int query_string_length = 0;
-    bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
-
-    // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
-    if (is_m3u8) {
+  case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE: {
+    int obj_status = -1;
+    if (TS_ERROR != TSHttpTxnCacheLookupStatusGet(txnp, &obj_status) && (TS_CACHE_LOOKUP_HIT_FRESH == obj_status)) {
       TSHttpTxnUntransformedRespCache(txnp, 1);
       TSHttpTxnTransformedRespCache(txnp, 0);
       TSVConn connp;
       connp = TSTransformCreate(transform_data, txnp);
-      MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length);
+      MyData *data = TSContDataGet(contp);
       TSContDataSet(connp, data);
       TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+    } else {
+      TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
     }
-    TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
-    return 0;
-  } break;
+  }
+    break;
+  case TS_EVENT_HTTP_READ_RESPONSE_HDR:
+    if (transformable(txnp)) {
+      TSHttpTxnUntransformedRespCache(txnp, 1);
+      TSHttpTxnTransformedRespCache(txnp, 0);
+      TSVConn connp;
+      connp = TSTransformCreate(transform_data, txnp);
+      MyData *data = TSContDataGet(contp);
+      TSContDataSet(connp, data);
+      TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
+    } 
+    break;
+  case TS_EVENT_HTTP_TXN_CLOSE:
+    TSContDestroy(contp);
+    break;
   default:
     break;
   }
-  
+  TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
   return 0;
 }
 
-// static int
-// transform_plugin(TSCont contp ATS_UNUSED, TSEvent event, void *edata)
-// {
-//   TSHttpTxn txnp = (TSHttpTxn)edata;
-//   TSDebug(PLUGIN_NAME, "Start transform");
-
-//   switch (event) {
-//   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
-//     if (transformable(txnp)) {
-//       char prefix_store[MAX_URL_LEN] = {'\0'};
-//       char* prefix = prefix_store;
-//       char query_string_store[MAX_URL_LEN] = {'\0'};
-//       char* query_string = query_string_store;
-//       int prefix_length = 0;
-//       int query_string_length = 0;
-//       bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
-
-//       // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
-//       if (is_m3u8) {
-//         transform_m3u8(txnp, prefix, prefix_length, query_string, query_string_length);
-//       }
-//     }
-//     TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
-//     return 0;
-//   default:
-//     break;
-//   }
-
-//   return 0;
-// }
-
-static int
-load(const char *filename)
+TSReturnCode
+TSRemapInit(TSRemapInterface *api_info, char *errbuf, int errbuf_size)
 {
-  TSFile file;
-  TSDebug(PLUGIN_NAME, "Config file name: %s", filename);
+  if (!api_info) {
+    snprintf(errbuf, errbuf_size, "[tsremap_init] - Invalid TSRemapInterface argument");
+    return TS_ERROR;
+  }
 
-  file = TSfopen(filename, "r");
+  if (api_info->tsremap_version < TSREMAP_VERSION) {
+    snprintf(errbuf, errbuf_size, "[TSRemapInit] - Incorrect API version %ld.%ld", api_info->tsremap_version >> 16,
+             (api_info->tsremap_version & 0xffff));
+    return TS_ERROR;
+  }
+
+  TSDebug(PLUGIN_NAME, "plugin is successfully initialized");
+  return TS_SUCCESS;
+}
+
+TSReturnCode
+TSRemapNewInstance(int argc, char *argv[], void **instance, char *errbuf, int errbuf_size)
+{
+  char config_filepath_buf[PATH_MAX], *config_file;
+
+  if ((argc < 3) || (argc > 4)) {
+    snprintf(errbuf, errbuf_size,
+             "[TSRemapNewInstance] - Argument count wrong (%d)... config file path is required first pparam, \"pristineurl\" is"
+             "optional second pparam.",
+             argc);
+    return TS_ERROR;
+  }
+  TSDebug(PLUGIN_NAME, "Initializing remap function of %s -> %s with config from %s", argv[0], argv[1], argv[2]);
+
+  if (argv[2][0] == '/') {
+    config_file = argv[2];
+  } else {
+    snprintf(config_filepath_buf, sizeof(config_filepath_buf), "%s/%s", TSConfigDirGet(), argv[2]);
+    config_file = config_filepath_buf;
+  }
+  TSDebug(PLUGIN_NAME, "config file name: %s", config_file);
+  
+  TSFile file;
+
+  file = TSfopen(config_file, "r");
   if (!file) {
-    return 0;
+    TSError("File config: %s not found", config_file);
+    return TS_ERROR;
   }
   char line[300];
   int line_no = 0;
@@ -810,7 +739,7 @@ load(const char *filename)
   int paramNum = 0;
   bool eat_comment = false;
 
-  cfg = TSmalloc(sizeof(struct config));
+  struct config *cfg = TSmalloc(sizeof(struct config));
   memset(cfg, 0, sizeof(struct config));
 
   while (TSfgets(file, line, sizeof(line)) != NULL) {
@@ -833,7 +762,7 @@ load(const char *filename)
     }
     char *pos = strchr(line, '=');
     if (pos == NULL) {
-      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, filename, line);
+      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
       continue;
     }
     *pos        = '\0';
@@ -884,42 +813,46 @@ load(const char *filename)
     } else if (strncmp(line, "knumber", 1) == 0) {
       cfg->knumber = atoi(value);
     } else {
-      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, filename, line);
+      TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
   }
 
   TSfclose(file);
-  return 1;
+  *instance = (void *)cfg;
+  return TS_SUCCESS;
 }
 
 void
-TSPluginInit(int argc, const char *argv[])
+TSRemapDeleteInstance(void *instance)
 {
-  TSPluginRegistrationInfo info;
+  free_cfg((struct config *)instance);
+}
 
-  info.plugin_name   = PLUGIN_NAME;
-  info.vendor_name   = "VTNET";
-  TSDebug(PLUGIN_NAME, "Start m3u8 transform plugin v2");
-
-  if (TSPluginRegister(&info) != TS_SUCCESS) {
-    TSError("[%s] Plugin registration failed", PLUGIN_NAME);
-    goto Lerror;
+TSRemapStatus
+TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo *rri)
+{
+  if (NULL == instance) {
+    TSDebug(PLUGIN_NAME, "No Rules configured, falling back to default");
+  } else {
+    TSDebug(PLUGIN_NAME, "Remap Rules configured for transform m3u8");
+    TSDebug(PLUGIN_NAME, "Start get url");
+    char prefix_store[MAX_URL_LEN] = {'\0'};
+    char* prefix = prefix_store;
+    char query_string_store[MAX_URL_LEN] = {'\0'};
+    char* query_string = query_string_store;
+    int prefix_length = 0;
+    int query_string_length = 0;
+    bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length);
+    struct config* cfg = (struct config*) instance; 
+    // TODO: Filter url by regex. Now just transform every file with url contain .m3u8;
+    if (is_m3u8) {
+      TSVConn connp;
+      connp = TSContCreate(transform_m3u8_if_needed, NULL);
+      MyData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length, cfg);
+      TSContDataSet(connp, data);
+      TSHttpTxnHookAdd(txnp, TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK, connp);
+      TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, connp);
+    }
   }
-
-  if (argc != 2) {
-    TSError("[%s] Usage: %s <filename>", PLUGIN_NAME, argv[0]);
-    goto Lerror;
-  }
-
-  if (!load(argv[1])) {
-    TSError("[%s] Could not load %s", PLUGIN_NAME, argv[1]);
-    goto Lerror;
-  }
-
-  TSHttpHookAdd(TS_HTTP_PRE_REMAP_HOOK, TSContCreate(transform_plugin, NULL));
-  return;
-
-Lerror:
-
-  TSError("[%s] Unable to initialize plugin", PLUGIN_NAME);
+  return TSREMAP_NO_REMAP;
 }
