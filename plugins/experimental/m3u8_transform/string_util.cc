@@ -36,3 +36,14 @@ trim_if(string &s, int (*fp)(int))
   ltrim_if(s, fp);
   rtrim_if(s, fp);
 }
+
+
+string remove_filename_from_path(string path, int* path_length) {
+    size_t last_slash_pos = path.rfind('/');
+    if (last_slash_pos != string::npos) {
+    path = path.substr(0, last_slash_pos + 1);
+    *(path_length) = *(path_length) - (*path_length - last_slash_pos);
+    }
+
+    return path;
+}
