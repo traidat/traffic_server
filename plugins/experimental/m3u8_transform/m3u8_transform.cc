@@ -131,25 +131,25 @@ bool verify_request_url(TSHttpTxn txnp, string& prefix, int* prefix_length, stri
 }
 
 string
-add_token_and_prefix(const string &file_data, Config *cfg, const string &prefix, const string &query_string, int *data_size)
+add_token_and_prefix(ContData* data, bool is_full_file)
 {
   string result;
-  istringstream stream(file_data);
+  istringstream stream(data->file_content);
   string line;
   while (getline(stream, line)) {
-    if (line.back() == '\n') {
-      line.pop_back();
-    }
     TSDebug("PLUGIN_NAME", "LINE: %s (%lu)", line.c_str(), line.length());
-    if (line[0] != '#') {
-      rewrite_line_without_tag(line, prefix, query_string, result, cfg);
-    } else {
-      rewrite_line_with_tag(line, prefix, query_string, result, cfg);
-    }
-    if (!stream.eof()) {
+    if (!stream.eof() || (stream.eof() && (is_full_file || data->file_content.back() == '\n'))) {
+      if (line[0] != '#') {
+        rewrite_line_without_tag(line, data->prefix, data->query_string, result, data->config);
+      } else {
+        rewrite_line_with_tag(line, data->prefix, data->query_string, result, data->config);
+      }
       result += "\n";
+    } else {
+      update_file_content(data, line);
     }
   }
+  
   return result;
 }
 
@@ -182,12 +182,13 @@ handle_transform_m3u8(TSCont contp)
     data                = my_data_alloc_with_url("", 0,"", 0, NULL);
     data->output_buffer = TSIOBufferCreate();
     data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
-    // data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, towrite);
+    data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, INT64_MAX);
     TSContDataSet(contp, data);
   } else if (data->output_buffer == NULL) {
     towrite = TSVIONBytesGet(write_vio);
     data->output_buffer = TSIOBufferCreate();
     data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
+    data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, INT64_MAX);
   }
 
   /* We also check to see if the write VIO's buffer is non-NULL. A
@@ -234,12 +235,12 @@ handle_transform_m3u8(TSCont contp)
     }
     if (towrite > 0) {
       /* Copy the data from the read buffer to the output buffer. */
-      // TSIOBufferCopy(data->output_buffer, TSVIOReaderGet(write_vio), towrite, 0);
+      
       char* file_data = (char*) malloc(towrite + 1);
       TSIOBufferReaderCopy(TSVIOReaderGet(write_vio), file_data, towrite);
       string content(file_data, towrite);
       free(file_data);
-      update_file_content(data, content, towrite);
+      append_file_content(data, content);
 
       /* Tell the read buffer that we have read the data and are no
          longer interested in it. */
@@ -247,49 +248,44 @@ handle_transform_m3u8(TSCont contp)
 
       /* Modify the write VIO to reflect how much data we've
          completed. */
-      TSVIONDoneSet(write_vio, data->file_size);
+      TSVIONDoneSet(write_vio, TSVIONDoneGet(write_vio) + towrite);
     }
   }
 
   /* Now we check the write VIO to see if there is data left to
      read. */
   if (TSVIONTodoGet(write_vio) > 0) {
+    string result = add_token_and_prefix(data, false);
+    update_file_size(data, result.size());
+    TSIOBufferWrite(data->output_buffer, result.c_str(), result.size());
     if (towrite > 0) {
       /* If there is data left to read, then we reenable the output
          connection by reenabling the output VIO. This will wakeup
          the output connection and allow it to consume data from the
          output buffer. */
-      // TSVIOReenable(data->output_vio);
+      TSVIOReenable(data->output_vio);
 
       /* Call back the write VIO continuation to let it know that we
          are ready for more data. */
       TSContCall(TSVIOContGet(write_vio), TS_EVENT_VCONN_WRITE_READY, write_vio);
     }
   } else {
+    string result = add_token_and_prefix(data, true);
+    update_file_size(data, result.size());
+    TSIOBufferWrite(data->output_buffer, result.c_str(), result.size());
     /* If there is no data left to read, then we modify the output
        VIO to reflect how much data the output connection should
        expect. This allows the output connection to know when it
        is done reading. We then reenable the output connection so
        that it can consume the data we just gave it. */
-    data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, towrite);
-    TSDebug(PLUGIN_NAME, "Request prefix: %s", data->prefix.c_str());
-    TSDebug(PLUGIN_NAME, "Request query string: %s", data->query_string.c_str());
-    int data_size = data->file_size;
+   
     
-    /* Copy file data from buffer*/
-    TSDebug(PLUGIN_NAME, "File data: %s with length %d", data->file_content.c_str(), data->file_size);
     // bool is_gzip = is_gzip_data(file_data, data_size);
     // if (is_gzip) {
     //   file_data = unzip_file_data(file_data, &data_size);
     //   TSDebug(PLUGIN_NAME, "Unzip data: %s", file_data);
     //   TSDebug(PLUGIN_NAME, "Data size after unzip: %d", data_size);
     // } 
-        
-    /* Add token and prefix to every link in file*/
-    string result = add_token_and_prefix(data->file_content, data->config, data-> prefix,  data-> query_string, &data_size);
-    data_size = result.size();
-    TSDebug(PLUGIN_NAME, "Length of text: %d", data_size);
-    TSDebug(PLUGIN_NAME, "File after transform: %s", result.c_str());
     // if (is_gzip) {
     //   result = gzip_data(result, &data_size);
     //   TSDebug(PLUGIN_NAME, "File after gzip: %s", result);
@@ -298,7 +294,6 @@ handle_transform_m3u8(TSCont contp)
 
     /* Remove all data from reader and add content of file after tranform to reader*/
     // TSIOBufferReaderConsume(data->output_reader, TSIOBufferReaderAvail(data->output_reader));
-    data->file_size = data_size;
     // int64_t avail;
     // for (;;) {
     //   TSIOBufferBlock blk = TSIOBufferStart(data->output_buffer);
@@ -328,9 +323,7 @@ handle_transform_m3u8(TSCont contp)
     //   }
     // }
     // TSDebug(PLUGIN_NAME, "Reader available: %s", TSIOBufferReaderAvail(data->output_reader));
-
-    TSIOBufferWrite(data->output_buffer, result.c_str(), data_size);
-    TSVIONBytesSet(data->output_vio, data_size);
+    TSVIONBytesSet(data->output_vio, data->file_size);
     
     // TSVIONBytesSet(data->output_vio, TSVIONDoneGet(write_vio));
 

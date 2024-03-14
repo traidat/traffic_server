@@ -13,7 +13,7 @@
 #include "object.cc"
 
 #define PLUGIN_NAME "m3u8_transform"
-#define MAX_URL_LEN 1024
+#define MAX_URL_LEN 100000
 #define USIG_HMAC_SHA1 1
 #define USIG_HMAC_MD5 2
 #define SHA1_SIG_SIZE 20
@@ -247,4 +247,3 @@ rewrite_line_with_tag(std::string &line, const std::string &prefix, const std::s
     result += line;
   }
 }
-

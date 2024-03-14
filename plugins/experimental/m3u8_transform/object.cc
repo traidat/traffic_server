@@ -23,7 +23,6 @@ struct ContData {
   TSVIO output_vio;
   TSIOBuffer output_buffer;
   TSIOBufferReader output_reader;
-  TSIOBufferReader temp_reader;
   string prefix;
   int prefix_length;
   string query_string;
@@ -39,7 +38,6 @@ my_data_alloc_with_url(string prefix, int prefix_length, string query_string, in
   data->output_vio    = nullptr;
   data->output_buffer = nullptr;
   data->output_reader = nullptr;
-  data->temp_reader = nullptr;
   data->prefix = prefix;
   data->prefix_length = prefix_length;
   data->query_string = query_string;
@@ -51,8 +49,15 @@ my_data_alloc_with_url(string prefix, int prefix_length, string query_string, in
   return data;
 }
 
-void update_file_content(ContData* data, string file_content, int file_size) {
+void update_file_content(ContData* data, string file_content) {
+  data->file_content = file_content;
+}
+
+void append_file_content(ContData* data, string file_content) {
   data->file_content = data->file_content + file_content;
+}
+
+void update_file_size(ContData* data, int file_size) {
   data->file_size = data->file_size + file_size;
 }
 
@@ -60,9 +65,6 @@ void my_data_destroy(ContData* data) {
   if (data) {
     if (data->output_reader) {
       TSIOBufferReaderFree(data->output_reader);
-    }
-    if (data->temp_reader) {
-      TSIOBufferReaderFree(data->temp_reader);
     }
     if (data->output_buffer) {
       TSIOBufferDestroy(data->output_buffer);
