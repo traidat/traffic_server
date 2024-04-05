@@ -64,8 +64,10 @@ struct config {
   char hash_query_param[MAX_HASH_QUERY_PARAM_NUM][MAX_HASH_QUERY_LEN];
   int paramNum;
   char use_parts[MAX_USE_PARTS_LEN];
-  int algorithm;  
+  int algorithm;
   int knumber;
+  char bypass_method[10][10];
+  int method_num;
 };
 
 static void
@@ -141,6 +143,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
   int line_no = 0;
   int keynum;
   int paramNum = 0;
+  int method_num = 0;
   bool eat_comment = false;
 
   cfg = TSmalloc(sizeof(struct config));
@@ -263,6 +266,15 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
       cfg->algorithm = atoi(value);
     } else if (strncmp(line, "knumber", 1) == 0) {
       cfg->knumber = atoi(value);
+    } else if (strncmp(line, "bypass_method", 13) == 0) {
+      char* method;
+      while ((method = strtok_r(value, ",", &method))) {
+        TSDebug(PLUGIN_NAME, "Bypass method number %d: %s", method_num, method);
+        snprintf(&cfg->bypass_method[method_num][0], 10, "%s", method);
+        value = value + strlen(method) + 1;
+        method_num = method_num + 1;
+      }
+      cfg->method_num = method_num;
     } else {
       TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
@@ -592,6 +604,20 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   unsigned char sig[MAX_SIG_SIZE + 1];
   char sig_string[2 * MAX_SIG_SIZE + 1];
 
+
+  int method_len = 0;
+  const char* method = TSHttpHdrMethodGet(rri->requestBufp, rri->requestHdrp, &method_len);
+  char* request_method = (char*) malloc(method_len * sizeof(char));
+  strncpy(request_method, method, method_len);
+  *(request_method + method_len) = '\0';
+
+  for (int i = 0; i < cfg->method_num; i++) {
+    if (strcmp(request_method, &(cfg->bypass_method[i])) == 0) {
+      free(request_method);
+      goto allow;
+    }
+  }
+
   if (current_url_len >= MAX_REQ_LEN - 1) {
     err_log(current_url, "Request Url string too long");
     goto deny;
@@ -777,7 +803,7 @@ TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     } else {
       TSDebug(PLUGIN_NAME, "Parts: %s", parts);
     }
-  } else { 
+  } else {
     if (cfg->use_parts != NULL) {
       TSDebug(PLUGIN_NAME, "Use parts: %s", cfg->use_parts);
       parts = cfg->use_parts;
