@@ -171,17 +171,34 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
             TSError("[m3u8_transform] Cannot set empty request parameter");
         }
     } else if (request_origin_param.size() > 0 && TS_SUCCESS != TSUrlHttpQuerySet(buf, loc, request_origin_param.c_str(), request_origin_param.size())) {
-        TSDebug("[m3u8_transform] Cannot set request parameter: %s", request_origin_param.c_str());
+        TSDebug(PLUGIN_NAME, "Cannot set request parameter: %s", request_origin_param.c_str());
     }
 
     *query_param_length = next_request_param.size();
     return next_request_param;
 }
 
-void
+void deleteSecondLastLine(string& str) {
+    size_t last_pos = str.find_last_of('\n'); 
+    if (last_pos != string::npos) { 
+        size_t second_last_pos = str.find_last_of('\n', last_pos - 1); 
+        if (second_last_pos != string::npos) { 
+            str.erase(second_last_pos, last_pos - second_last_pos - 1);
+        }
+    }
+}
+
+int
 rewrite_line_without_tag(std::string &line, const std::string &prefix, const std::string &query_string, std::string &result,
                          Config *cfg)
 {
+  if (cfg->enable_remove_line == 1) {
+    for (int i = 0; i < (int) cfg->removed_string.size(); i++) {
+      if (line.find(cfg->removed_string.at(i)) != string::npos) {
+        return 0;
+      }
+    }
+  }
   if (line.find(".ts") != string::npos || line.find(".m3u8") != string::npos || line.find(".m4s") != string::npos ||
       line.find(".mp4") != string::npos) {
     string url = prefix + line;
@@ -208,6 +225,7 @@ rewrite_line_without_tag(std::string &line, const std::string &prefix, const std
   } else {
     result += line;
   }
+  return 1;
 }
 
 void

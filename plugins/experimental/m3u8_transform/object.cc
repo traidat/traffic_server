@@ -17,6 +17,8 @@ struct Config {
   int algorithm;  
   int knumber;
   set<string> origin_param;
+  int enable_remove_line = 0;
+  vector<string> removed_string;
 };
 
 struct ContData {
