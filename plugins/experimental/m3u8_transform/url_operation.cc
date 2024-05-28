@@ -141,11 +141,12 @@ extern "C" {
 string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param, TSMBuffer buf, TSMLoc loc) {
     istringstream paramstream(query_param);
     string param;
-    
+
     string request_origin_param = ""; // They are parameter that we keep and send to origin
     string next_request_param = ""; // They are parameter that we do not send to origin, but we will add them to every link in file m3u8'
     while (getline(paramstream, param, '&')) {
-        int pos = param.find("=");
+      size_t pos = param.find("=");
+      if (pos != string::npos) {
         string key = param.substr(0, pos);
         string value = param.substr(pos, param.size());
         if (origin_param.size() == 0 || key == "token" || origin_param.find(key) != origin_param.end()) {
@@ -161,6 +162,9 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
                 next_request_param.append("&").append(param);
             }
         }
+      } else {
+        TSError("[m3u8_transform] Cannot get query param %s", param.c_str());
+      }
     }
 
     TSDebug(PLUGIN_NAME, "Request origin param: %s", request_origin_param.c_str());
@@ -179,10 +183,10 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
 }
 
 void deleteSecondLastLine(string& str) {
-    size_t last_pos = str.find_last_of('\n'); 
-    if (last_pos != string::npos) { 
-        size_t second_last_pos = str.find_last_of('\n', last_pos - 1); 
-        if (second_last_pos != string::npos) { 
+    size_t last_pos = str.find_last_of('\n');
+    if (last_pos != string::npos) {
+        size_t second_last_pos = str.find_last_of('\n', last_pos - 1);
+        if (second_last_pos != string::npos) {
             str.erase(second_last_pos, last_pos - second_last_pos - 1);
         }
     }
