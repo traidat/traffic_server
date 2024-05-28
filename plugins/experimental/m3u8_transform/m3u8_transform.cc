@@ -138,13 +138,22 @@ add_token_and_prefix(ContData* data, bool is_full_file)
   string line;
   while (getline(stream, line)) {
     TSDebug("PLUGIN_NAME", "LINE: %s (%lu)", line.c_str(), line.length());
+    if (line.back() == '\r') {
+      line.pop_back();
+    }
     if (!stream.eof() || (stream.eof() && (is_full_file || data->file_content.back() == '\n'))) {
       if (line[0] != '#') {
-        rewrite_line_without_tag(line, data->prefix, data->query_string, result, data->config);
+        int is_write = rewrite_line_without_tag(line, data->prefix, data->query_string, result, data->config);
+        if (is_write == 1) {
+          result += "\n";
+        } else {
+          // When we decide to not write a bypass line, we need to delete line with tag before
+          deleteSecondLastLine(result);
+        }
       } else {
         rewrite_line_with_tag(line, data->prefix, data->query_string, result, data->config);
+        result += "\n";
       }
-      result += "\n";
     } else {
       update_file_content(data, line);
     }
@@ -564,6 +573,16 @@ TSRemapNewInstance(int argc, char *argv[], void **instance, char *errbuf, int er
         TSDebug(PLUGIN_NAME, "Origin param number %d: %s", param_num, param.c_str());
         cfg->origin_param.insert(param);
       }
+    } else if (key == "removed_string") {
+      istringstream removed_string_stream(value.c_str());
+      string removed_string;
+      while (getline(removed_string_stream, removed_string, ',')) {
+        TSDebug(PLUGIN_NAME, "Remove line with string %s", removed_string.c_str());
+        cfg->removed_string.push_back(removed_string);
+      }
+    } else if (key == "enable_remove_line") {
+      cfg->enable_remove_line = stoi(value);
+      TSDebug(PLUGIN_NAME, "Enable remove line: %s", value.c_str());
     } else {
       TSError("[m3u8_transform] Error when parsing line %d: %s", line_no, line.c_str());
     }
