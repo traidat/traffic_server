@@ -136,8 +136,9 @@ add_token_and_prefix(ContData* data, bool is_full_file)
   string result;
   istringstream stream(data->file_content);
   string line;
+  bool has_last_line = false;
   while (getline(stream, line)) {
-    TSDebug("PLUGIN_NAME", "LINE: %s (%lu)", line.c_str(), line.length());
+    TSDebug(PLUGIN_NAME, "LINE: %s (%lu)", line.c_str(), line.length());
     if (line.back() == '\r') {
       line.pop_back();
     }
@@ -156,7 +157,13 @@ add_token_and_prefix(ContData* data, bool is_full_file)
       }
     } else {
       update_file_content(data, line);
+      has_last_line = true;
     }
+  }
+
+  if (!has_last_line) {
+    string empty = "";
+    data->file_content = empty;
   }
   
   return result;
