@@ -70,6 +70,7 @@ struct config {
   int method_num;
   char timeshift_param[MAX_TIME_SHIFT_PARAM][MAX_HASH_QUERY_LEN];
   int timeshift_param_num;
+  bool enable_watermark;
 };
 
 static void
@@ -148,6 +149,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
   int method_num = 0;
   bool eat_comment = false;
   int timeshift_param_num = 0;
+  bool enable_watermark = false;
 
   cfg = TSmalloc(sizeof(struct config));
   memset(cfg, 0, sizeof(struct config));
@@ -190,6 +192,8 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
       free_cfg(cfg);
       return TS_ERROR;
     }
+
+    cfg->enable_watermark = enable_watermark;
     if (strncmp(line, "key", 3) == 0) {
       if (strncmp(line + 3, "0", 1) == 0) {
         keynum = 0;
@@ -287,6 +291,11 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
         timeshift_param_num = timeshift_param_num + 1;
       }
       cfg->timeshift_param_num = timeshift_param_num;
+    } else if (strncmp(line, "enable_watermark", 16) == 0) {
+      int enable = atoi(value);
+      if (enable == 1) {
+        cfg->enable_watermark = true;
+      }
     } else {
       TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
@@ -399,8 +408,10 @@ getAppQueryString(const struct config* cfg, const char *query_string, int query_
     }
   } while (!done);
 
-  // Add timewater mark for manifest file (hls or dash)
-  if (strstr(current_url, ".m3u8") != NULL || (strstr(current_url, ".mpd") != NULL)) {
+  // Add timewater mark for manifest file (hls or dash) exclude CUTV and master manifest (index.m3u8)
+  if (cfg->enable_watermark && strstr(query_string, "begin=") == NULL && strstr(query_string, "end=") == NULL 
+    && strstr(current_url, "/index.m3u8") == NULL && strstr(current_url, "/index.mpd") == NULL 
+    && (strstr(current_url, ".m3u8") != NULL || (strstr(current_url, ".mpd") != NULL))) {
     
     int timeshift = extractTimeshift(cfg->timeshift_param, cfg->timeshift_param_num, p);
 
