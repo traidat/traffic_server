@@ -32,10 +32,12 @@ struct ContData {
   int file_size;
   string file_content;
   Config* config;
+  string time_shift;
+  bool should_add_time_shift;
 };
 
 ContData* 
-my_data_alloc_with_url(string prefix, int prefix_length, string query_string, int query_string_length, Config* cfg) {
+my_data_alloc_with_url(string prefix, int prefix_length, string query_string, int query_string_length, Config* cfg, string time_shift) {
   ContData *data = new ContData();
   data->output_vio    = nullptr;
   data->output_buffer = nullptr;
@@ -48,6 +50,8 @@ my_data_alloc_with_url(string prefix, int prefix_length, string query_string, in
   string empty("");
   data->file_content = empty;
   data->config = cfg;
+  data->time_shift = time_shift;
+  data->should_add_time_shift = false;
   return data;
 }
 

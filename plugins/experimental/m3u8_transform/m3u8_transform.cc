@@ -54,12 +54,14 @@ using namespace std;
 
 // Verify request is m3u8 file and get prefix and query_string of request URL
 // TODO: Verify host is IP or domain, port is 80, 443 or not
-bool verify_request_url(TSHttpTxn txnp, string& prefix, int* prefix_length, string& query_string, int* query_string_length, set<string> origin_param) {
+bool verify_request_url(TSHttpTxn txnp, string& prefix, int* prefix_length, string& query_string, int* query_string_length, set<string> origin_param, string& time_shift) {
   TSMBuffer buf;
   TSMLoc loc;
+  bool is_master_manifest = false;
   if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &buf, &loc)) {
     TSMLoc url_loc;
     if (TS_SUCCESS == TSHttpHdrUrlGet(buf, loc, &url_loc)) {
+      // Get path of request
       int path_length = 0;
       const char* path = TSUrlPathGet(buf, url_loc, &path_length);
       string path_str(path, path_length);
@@ -70,11 +72,14 @@ bool verify_request_url(TSHttpTxn txnp, string& prefix, int* prefix_length, stri
         TSDebug(PLUGIN_NAME, "Path %s will not transform", path_str.c_str());
         return false;
       }
-
       TSDebug(PLUGIN_NAME, "Path %s will transform", path_str.c_str());
+
+      // Get scheme
       int scheme_length = 0;
       const char* scheme = TSUrlSchemeGet(buf, url_loc, &scheme_length);
       string scheme_str(scheme, scheme_length);
+
+      // Get query param
       int query_param_length = 0;
       const char* query_param = TSUrlHttpQueryGet(buf, url_loc, &query_param_length);
       string query_param_str(query_param, query_param_length);
@@ -110,13 +115,17 @@ bool verify_request_url(TSHttpTxn txnp, string& prefix, int* prefix_length, stri
         prefix = prefix + host_str;
         *(prefix_length) = *(prefix_length) + host_length;
       }
+      if (path_str.find("/index.m3u8") != string::npos) {
+        is_master_manifest = true;
+      }
   
       // Remove file name from prefix
       prefix = prefix + "/" + remove_filename_from_path(path_str, &path_length);
       *(prefix_length) = *(prefix_length) + 1 + path_length;
 
       // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
-      query_string = optimize_query_param(query_param_str, query_string_length, origin_param, buf, url_loc);
+      query_string = optimize_query_param(query_param_str, query_string_length, origin_param, buf, url_loc, is_master_manifest, time_shift);
+      
 
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, loc, url_loc));
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
@@ -144,7 +153,12 @@ add_token_and_prefix(ContData* data, bool is_full_file)
     }
     if (!stream.eof() || (stream.eof() && (is_full_file || data->file_content.back() == '\n'))) {
       if (line[0] != '#') {
-        int is_write = rewrite_line_without_tag(line, data->prefix, data->query_string, result, data->config);
+        int is_write;
+        if (data->should_add_time_shift) {
+          is_write = rewrite_line_without_tag_tstv(line, data->prefix, data->query_string, result, data->time_shift, data->config);
+        } else {
+          is_write = rewrite_line_without_tag(line, data->prefix, data->query_string, result, data->config);
+        }
         if (is_write == 1) {
           result += "\n";
         } else {
@@ -195,7 +209,7 @@ handle_transform_m3u8(TSCont contp)
   data = static_cast<ContData*> (TSContDataGet(contp));
   if (!data) {
     towrite = TSVIONBytesGet(write_vio);
-    data                = my_data_alloc_with_url("", 0,"", 0, NULL);
+    data                = my_data_alloc_with_url("", 0,"", 0, NULL, "");
     data->output_buffer = TSIOBufferCreate();
     data->output_reader = TSIOBufferReaderAlloc(data->output_buffer);
     data->output_vio    = TSVConnWrite(output_conn, contp, data->output_reader, INT64_MAX);
@@ -423,13 +437,16 @@ transform_data(TSCont contp, TSEvent event, void *edata ATS_UNUSED)
 }
 
 void
-add_transform_hook(TSHttpTxn txnp, TSCont contp)
+add_transform_hook(TSHttpTxn txnp, TSCont contp, bool is_hit)
 {
   TSHttpTxnUntransformedRespCache(txnp, 1);
   TSHttpTxnTransformedRespCache(txnp, 0);
   TSVConn connp;
   connp          = TSTransformCreate(transform_data, txnp);
   ContData *data = static_cast<ContData *>(TSContDataGet(contp));
+  if (data->time_shift.size() > 0 && is_hit) {
+    data->should_add_time_shift = true;
+  } 
   TSContDataSet(connp, data);
   TSHttpTxnHookAdd(txnp, TS_HTTP_RESPONSE_TRANSFORM_HOOK, connp);
 }
@@ -441,7 +458,7 @@ transform_m3u8_if_needed(TSCont contp, TSEvent event, void *edata) {
   case TS_EVENT_HTTP_CACHE_LOOKUP_COMPLETE: {
     int obj_status = -1;
     if (TS_ERROR != TSHttpTxnCacheLookupStatusGet(txnp, &obj_status) && (TS_CACHE_LOOKUP_HIT_FRESH == obj_status)) {
-      add_transform_hook(txnp, contp);
+      add_transform_hook(txnp, contp, true);
     } else {
       TSHttpTxnHookAdd(txnp, TS_HTTP_READ_RESPONSE_HDR_HOOK, contp);
     }
@@ -449,7 +466,7 @@ transform_m3u8_if_needed(TSCont contp, TSEvent event, void *edata) {
     break;
   case TS_EVENT_HTTP_READ_RESPONSE_HDR:
     if (transformable(txnp)) {
-      add_transform_hook(txnp, contp);
+      add_transform_hook(txnp, contp, false);
     } 
     break;
   case TS_EVENT_HTTP_TXN_CLOSE:
@@ -624,7 +641,8 @@ TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     int prefix_length = 0;
     int query_string_length = 0;
     Config* cfg = static_cast<Config *> (instance); 
-    bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length, cfg->origin_param);
+    string time_shift = "";
+    bool is_m3u8 = verify_request_url(txnp, prefix, &prefix_length, query_string, &query_string_length, cfg->origin_param, time_shift);
     // int n = 10000;
     // string prefix_temp = "http://";
     // for(int i = 0; i < n; i++) {
@@ -636,7 +654,7 @@ TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo *rri)
     if (is_m3u8) {
       TSVConn connp;
       connp = TSContCreate(transform_m3u8_if_needed, NULL);
-      ContData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length, cfg);
+      ContData *data = my_data_alloc_with_url(prefix, prefix_length, query_string, query_string_length, cfg, time_shift);
       TSContDataSet(connp, data);
       TSHttpTxnHookAdd(txnp, TS_HTTP_CACHE_LOOKUP_COMPLETE_HOOK, connp);
       TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, connp);
