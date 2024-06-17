@@ -138,7 +138,8 @@ extern "C" {
 }
 
 // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
-string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param, TSMBuffer buf, TSMLoc loc) {
+string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param, 
+                            TSMBuffer buf, TSMLoc loc, bool is_master_manifest, string& time_shift) {
     istringstream paramstream(query_param);
     string param;
 
@@ -149,6 +150,14 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
       if (pos != string::npos) {
         string key = param.substr(0, pos);
         string value = param.substr(pos, param.size());
+        // We will remove wm param because this param only use for cache key plugin
+        if (key == "wm") {
+          continue;
+        }
+        // In case master manifest and TSTV, we should add time_shift for later use, if not master manifest, we do not use time_shift for anything.
+        if (is_master_manifest && (key == "timeshift" || key == "time_shift" || key == "delay") && time_shift.size() == 0) {
+          time_shift = value;
+        }
         if (origin_param.size() == 0 || key == "token" || origin_param.find(key) != origin_param.end()) {
             if (request_origin_param.size() == 0) {
                 request_origin_param.append(param);
@@ -190,6 +199,47 @@ void deleteSecondLastLine(string& str) {
             str.erase(second_last_pos, last_pos - second_last_pos - 1);
         }
     }
+}
+
+int
+rewrite_line_without_tag_tstv(std::string &line, const std::string &prefix, const std::string &query_string, std::string &result, std::string &time_shift,
+                         Config *cfg)
+{
+  if (cfg->enable_remove_line == 1) {
+    for (int i = 0; i < (int) cfg->removed_string.size(); i++) {
+      if (line.find(cfg->removed_string.at(i)) != string::npos) {
+        return 0;
+      }
+    }
+  }
+  if (line.find(".ts") != string::npos || line.find(".m3u8") != string::npos || line.find(".m4s") != string::npos ||
+      line.find(".mp4") != string::npos) {
+    string url = prefix + line;
+    if (!query_string.empty()) {
+      if (url.find('?') != string::npos) {
+        url += "&";
+      } else {
+        url += "?";
+      }
+      url += query_string;
+    }
+    result += url;
+    unsigned char token[MAX_SIG_SIZE + 1] = {'\0'};
+    unsigned int token_length             = 0;
+    bool is_success                       = generate_token(url.c_str(), cfg, token, &token_length);
+    if (is_success) {
+      result += "&token=";
+      for (unsigned int i = 0; i < token_length; i++) {
+        char buffer[3];
+        sprintf(buffer, "%02x", token[i]);
+        result += buffer;
+      }
+    }
+    result = result + "&time_shift" + time_shift;
+  } else {
+    result += line;
+  }
+  return 1;
 }
 
 int
