@@ -68,6 +68,8 @@ struct config {
   int knumber;
   char bypass_method[10][10];
   int method_num;
+  char timeshift_param[MAX_TIME_SHIFT_PARAM][MAX_HASH_QUERY_LEN];
+  int timeshift_param_num;
 };
 
 static void
@@ -145,6 +147,7 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
   int paramNum = 0;
   int method_num = 0;
   bool eat_comment = false;
+  int timeshift_param_num = 0;
 
   cfg = TSmalloc(sizeof(struct config));
   memset(cfg, 0, sizeof(struct config));
@@ -275,6 +278,15 @@ TSRemapNewInstance(int argc, char *argv[], void **ih, char *errbuf, int errbuf_s
         method_num = method_num + 1;
       }
       cfg->method_num = method_num;
+    } else if (strncmp(line, "timeshift_param", 15) == 0) {
+      char* param;
+      while ((param = strtok_r(value, ",", &param))) {
+        TSDebug(PLUGIN_NAME, "Timeshift param number %d: %s", timeshift_param_num, param);
+        snprintf(&cfg->timeshift_param[timeshift_param_num][0], MAX_HASH_QUERY_LEN, "%s", param);
+        value = value + strlen(param) + 1;
+        timeshift_param_num = timeshift_param_num + 1;
+      }
+      cfg->timeshift_param_num = timeshift_param_num;
     } else {
       TSError("[url_sig] Error parsing line %d of file %s (%s)", line_no, config_file, line);
     }
@@ -339,7 +351,7 @@ err_log(const char *url, const char *msg)
 // See the README.  All Signing parameters must be concatenated to the end
 // of the url and any application query parameters.
 static char *
-getAppQueryString(const char *query_string, int query_length)
+getAppQueryString(const struct config* cfg, const char *query_string, int query_length, char *const current_url)
 {
   int done = 0;
   char *p;
@@ -357,6 +369,7 @@ getAppQueryString(const char *query_string, int query_length)
   char result[MAX_QUERY_LEN];
   memset(result, '\0', sizeof(result));
   TSDebug(PLUGIN_NAME, "Result %s", result);
+  // Remove token query param
   do {
     char* token = strstr(p, SIG_QSTRING "=");
     if (token != NULL) {
@@ -365,6 +378,9 @@ getAppQueryString(const char *query_string, int query_length)
       char* delimeter = strchr(token, '&');
       TSDebug(PLUGIN_NAME, "Delimeter %s", delimeter);
       TSDebug(PLUGIN_NAME, "P %s", p);
+
+
+      // remove "&token={TOKEN}" and retain all other params
       if (token != p) {
         strncat(result, p, (token - p) - 1);
         if (delimeter != NULL) {
@@ -383,6 +399,20 @@ getAppQueryString(const char *query_string, int query_length)
     }
   } while (!done);
 
+  // Add timewater mark for manifest file (hls or dash)
+  if (strstr(current_url, ".m3u8") != NULL || (strstr(current_url, ".mpd") != NULL)) {
+    
+    int timeshift = extractTimeshift(cfg->timeshift_param, cfg->timeshift_param_num, p);
+
+    long long watermark = time(NULL) - timeshift;
+
+    // add watermark=%s;
+    char* join = (result[0] == '\0') ? "" : "&";
+    char* temp = result;
+    sprintf(result, "%s%swm=%lld", temp, join, watermark);
+  }
+  
+
   TSDebug(PLUGIN_NAME, "Result %s", result);
   if (strlen(result) > 0) {
     p = TSstrdup(result);
@@ -391,6 +421,38 @@ getAppQueryString(const char *query_string, int query_length)
   } else {
     return NULL;
   }
+}
+
+/**
+ *  params = [ "time_shift", "timeshift", "delay"]
+ * 
+ * 
+ * query_string: 
+ * uid=10&timeshift=1000&token=24234234324 => 1000
+ * channel=100&token=1000&delay=2&x=34324&u=34324324 => 
+ * time_shift=1234&a=342342&bb=343434343434&c=adfjaslfjsadk324l32j4l => 1234
+ */
+ 
+int extractTimeshift(char params[][MAX_HASH_QUERY_LEN], int param_num, char* query_string) {
+	for (int i = 0; i < param_num; i++) {
+		char* param = params[i];
+		int result = 0;
+		
+		char* pos = strstr(query_string, param);
+    
+	    if (pos != NULL) {
+	        // Move the pointer to the position after "timeshift="
+	        pos += strlen(param);
+	        sscanf(pos, "=%d", &result);
+
+          // prevent NEGATIVE timeshift
+          if (result >= 0) {
+	          return result;
+          }
+	    }
+	}
+	
+	return 0;
 }
 
 /** fixedBufferWrite safely writes no more than *dest_len bytes to *dest_end
@@ -966,7 +1028,7 @@ allow:
   const char *app_qry       = NULL;
   if (current_query != NULL) {
     current_query++;
-    app_qry = getAppQueryString(current_query, strlen(current_query));
+    app_qry = getAppQueryString(cfg, current_query, strlen(current_query), current_url);
     TSDebug(PLUGIN_NAME, "Current query: %s", app_qry);
   }
   TSDebug(PLUGIN_NAME, "has_path_params: %d", has_path_params);
