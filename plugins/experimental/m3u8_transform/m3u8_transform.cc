@@ -52,7 +52,6 @@
 using namespace std;
 
 // Verify request is m3u8 file and get prefix and query_string of request URL
-// TODO: Verify host is IP or domain, port is 80, 443 or not
 bool
 verify_request_url(TSHttpTxn txnp, string &prefix, int *prefix_length, string &query_string, int *query_string_length,
                    set<string> origin_param, string &time_shift)
@@ -62,10 +61,7 @@ verify_request_url(TSHttpTxn txnp, string &prefix, int *prefix_length, string &q
   TSMBuffer remap_url_buf;
   TSMLoc remap_url_loc;
   TSMLoc url_loc;
-  bool is_master_manifest = false;
-  if (TS_SUCCESS == TSHttpTxnPristineUrlGet(txnp, &buf, &loc) 
-    && TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &remap_url_buf, &remap_url_loc) 
-    && TS_SUCCESS == TSHttpHdrUrlGet(remap_url_buf, remap_url_loc, &url_loc)) {
+  if (TS_SUCCESS == TSHttpTxnPristineUrlGet(txnp, &buf, &loc) ) {
     // Get path of request
     int path_length  = 0;
     const char *path = TSUrlPathGet(buf, loc, &path_length);
@@ -73,7 +69,6 @@ verify_request_url(TSHttpTxn txnp, string &prefix, int *prefix_length, string &q
     // Transform only request file .m3u8
     if (path_str.find(".m3u8") == string::npos) {
       ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
-      TSDebug(PLUGIN_NAME, "Path %s will not transform", path_str.c_str());
       return false;
     }
     TSDebug(PLUGIN_NAME, "Path %s will transform", path_str.c_str());
@@ -83,53 +78,50 @@ verify_request_url(TSHttpTxn txnp, string &prefix, int *prefix_length, string &q
     const char *scheme = TSUrlSchemeGet(buf, loc, &scheme_length);
     string scheme_str(scheme, scheme_length);
 
-    // Get query param
-    int query_param_length  = 0;
-    const char* query_param;
-    TSDebug(PLUGIN_NAME, "Get query param of remap url");
-    query_param = TSUrlHttpQueryGet(remap_url_buf, url_loc, &query_param_length);
-    string query_param_str(query_param, query_param_length);
-    
-    TSDebug(PLUGIN_NAME, "Query param: %s", query_param);
     prefix           = prefix + scheme_str + "://";
     *(prefix_length) = *(prefix_length) + scheme_length + 3;
 
-      int host_length  = 0;
-      const char *host = TSUrlHostGet(buf, loc, &host_length);
-      string host_str(host, host_length);
-      int port = TSUrlRawPortGet(buf, loc);
-      if (port > 0) {
-        string port_str = to_string(port);
-        host_length = host_length + 1 + port_str.size();
-        prefix = prefix + host_str + ":" + port_str;
-      } else {
-        prefix = prefix + host_str;
-      }
-      
-      *(prefix_length) = *(prefix_length) + host_length;
-
-    if (path_str.find("/index.m3u8") != string::npos) {
-      is_master_manifest = true;
+    int host_length  = 0;
+    const char *host = TSUrlHostGet(buf, loc, &host_length);
+    string host_str(host, host_length);
+    int port = TSUrlRawPortGet(buf, loc);
+    if (port > 0) {
+      string port_str = to_string(port);
+      host_length = host_length + 1 + port_str.size();
+      prefix = prefix + host_str + ":" + port_str;
+    } else {
+      prefix = prefix + host_str;
     }
+    
+    *(prefix_length) = *(prefix_length) + host_length;
 
     // Remove file name from prefix
     prefix           = prefix + "/" + remove_filename_from_path(path_str, &path_length);
     *(prefix_length) = *(prefix_length) + 1 + path_length;
 
-    // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
-    query_string =
-      optimize_query_param(query_param_str, query_string_length, origin_param, remap_url_buf, url_loc, is_master_manifest, time_shift);
+    // Get query param
+    int query_param_length  = 0;
+    const char* query_param;
+    TSDebug(PLUGIN_NAME, "Get query param of remap url");
+    if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &remap_url_buf, &remap_url_loc) 
+    && TS_SUCCESS == TSHttpHdrUrlGet(remap_url_buf, remap_url_loc, &url_loc)) {
+      query_param = TSUrlHttpQueryGet(remap_url_buf, url_loc, &query_param_length);
+      TSDebug(PLUGIN_NAME, "Query param: %s", query_param);
+      string query_param_str(query_param, query_param_length);
+      // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
+      query_string = optimize_query_param(query_param_str, query_string_length, origin_param, remap_url_buf, url_loc);
+      ASSERT_SUCCESS(TSHandleMLocRelease(remap_url_buf, remap_url_loc, url_loc));
+      ASSERT_SUCCESS(TSHandleMLocRelease(remap_url_buf, TS_NULL_MLOC, remap_url_loc));
+    }
 
     TSDebug(PLUGIN_NAME, "Prefix URL: %s", prefix.c_str());
     TSDebug(PLUGIN_NAME, "Query param string: %s", query_string.c_str());
     ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
-    ASSERT_SUCCESS(TSHandleMLocRelease(remap_url_buf, remap_url_loc, url_loc));
-    ASSERT_SUCCESS(TSHandleMLocRelease(remap_url_buf, TS_NULL_MLOC, remap_url_loc));
     return true;
-    
+  } else {
+    TSDebug(PLUGIN_NAME, "Cannot get request");
   }
-  TSDebug(PLUGIN_NAME, "Cannot get request");
-  ASSERT_SUCCESS(TSHandleMLocRelease(buf, TS_NULL_MLOC, loc));
+  
   return false;
 }
 
@@ -149,11 +141,11 @@ add_token_and_prefix(IOBufferData *buffer_data, bool is_full_file)
     if (!stream.eof() || (stream.eof() && (is_full_file || buffer_data->file_content.back() == '\n'))) {
       if (line[0] != '#') {
         int is_write;
-        if (txn_data->should_add_time_shift) {
-          is_write = rewrite_line_without_tag_tstv(line, txn_data->prefix, txn_data->query_string, result, txn_data->time_shift, txn_data->config);
-        } else {
-          is_write = rewrite_line_without_tag(line, txn_data->prefix, txn_data->query_string, result, txn_data->config);
-        }
+        // if (txn_data->should_add_time_shift) {
+        //   is_write = rewrite_line_without_tag_tstv(line, txn_data->prefix, txn_data->query_string, result, txn_data->time_shift, txn_data->config);
+        // } else {
+        is_write = rewrite_line_without_tag(line, txn_data->prefix, txn_data->query_string, result, txn_data->config);
+        // }
         if (is_write == 1) {
           result += "\n";
         } else {
@@ -374,9 +366,9 @@ add_transform_hook(TSHttpTxn txnp, TSCont contp, bool is_hit)
 
   TSVConn transform_body_contp = TSTransformCreate(transform_body_handler, txnp);
   TxnData *txn_data            = static_cast<TxnData *>(TSContDataGet(contp));
-  if (txn_data->time_shift.size() > 0 && is_hit) {
-    txn_data->should_add_time_shift = true;
-  }
+  // if (txn_data->time_shift.size() > 0 && is_hit) {
+  //   txn_data->should_add_time_shift = true;
+  // }
   IOBufferData *iobuffer_data = iobuffer_data_alloc(txn_data);
 
   TSContDataSet(transform_body_contp, iobuffer_data);
