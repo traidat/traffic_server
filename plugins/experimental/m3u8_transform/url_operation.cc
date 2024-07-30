@@ -138,7 +138,7 @@ extern "C" {
 }
 
 // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
-string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param, 
+string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param,
                             TSMBuffer buf, TSMLoc loc, bool is_master_manifest, string& time_shift) {
     istringstream paramstream(query_param);
     string param;
@@ -176,11 +176,11 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
       }
     }
 
-    TSDebug(PLUGIN_NAME, "Request origin param: %s", request_origin_param.c_str());
-    TSDebug(PLUGIN_NAME, "Param not send to origin: %s", next_request_param.c_str());
+    TSDebug(PLUGIN_NAME, "Request origin param: %s, length: %ld", request_origin_param.c_str(), request_origin_param.size());
+    TSDebug(PLUGIN_NAME, "Param not send to origin: %s, length: %ld", next_request_param.c_str(), next_request_param.size());
 
     if (request_origin_param.size() == 0) {
-        if (TS_SUCCESS != TSUrlHttpQuerySet(buf, loc, request_origin_param.c_str(), -1)) {
+        if (TS_SUCCESS != TSUrlHttpQuerySet(buf, loc, NULL, 0)) {
             TSError("[m3u8_transform] Cannot set empty request parameter");
         }
     } else if (request_origin_param.size() > 0 && TS_SUCCESS != TSUrlHttpQuerySet(buf, loc, request_origin_param.c_str(), request_origin_param.size())) {
