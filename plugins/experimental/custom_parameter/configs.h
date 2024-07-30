@@ -1,6 +1,8 @@
 #include <string>
 #include <set>
 #include <map>
+#include <vector>
+#include <list>
 
 #ifdef HAVE_PCRE_PCRE_H
 #include <pcre/pcre.h>
@@ -15,18 +17,29 @@ class ParameterConfig
 public: 
     ParameterConfig() {}
     set<string> getParams();
-    pcre* getUrlRegex();
-    pcre_extra* getUrlRegexExtra();
+    pcre* getUrlIncludeRegex();
+    pcre_extra* getUrlIncludeRegexExtra();
+    pcre* getUrlExcludeRegex();
+    pcre_extra* getUrlExcludeRegexExtra();
+    bool isPristineUrl();
 
     void setParams(set<string> params);
-    void setUrlRegex(pcre* regex);
-    void setUrlRegexExtra(pcre_extra* regexExtra);
+    void setUrlIncludeRegex(pcre* regex);
+    void setUrlIncludeRegexExtra(pcre_extra* regexExtra);
+    void setUrlExcludeRegex(pcre* regex);
+    void setUrlExcludeRegexExtra(pcre_extra* regexExtra);
+    void setIsPristineUrl(bool isPristineUrl);
     void freeRegex();
+    void freeIncludeRegex();
+    void freeExcludeRegex();
 
 protected:
     set<string> params;
-    pcre* urlRegex = nullptr;
-    pcre_extra* urlRegexExtra = nullptr;
+    pcre* urlIncludeRegex = nullptr;
+    pcre_extra* urlIncludeRegexExtra = nullptr;
+    pcre* urlExcludeRegex = nullptr;
+    pcre_extra* urlExcludeRegexExtra = nullptr;
+    bool _isPristineUrl = true;
 };
 
 class WMParameterConfig : public ParameterConfig
@@ -50,9 +63,11 @@ public:
 
     bool shouldIncludeParams();
     bool shouldAddParams();
-    void freeRegex();
     ParameterConfig* getIncludeParamConfig();
     WMParameterConfig* getAddParamConfig();
+
+    void freeRegex();
+    void free();
 
 protected:
     bool _shouldIncludeParams = false;

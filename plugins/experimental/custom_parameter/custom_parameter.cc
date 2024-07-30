@@ -50,10 +50,10 @@
 using namespace std;
 
 void 
-remapParam(TSMBuffer buf, TSMLoc loc, TSMLoc url_loc, string param) 
+remapParam(TSMBuffer buf, TSMLoc url_loc, string param) 
 {
   if (param.length() == 0) {
-    if (TS_SUCCESS != TSUrlHttpQuerySet(buf, loc, NULL, 0)) {
+    if (TS_SUCCESS != TSUrlHttpQuerySet(buf, url_loc, NULL, 0)) {
       TSError("[custom_parameter] Cannot set empty request parameter");
     }
   } else if (param.size() > 0 &&
@@ -63,8 +63,7 @@ remapParam(TSMBuffer buf, TSMLoc loc, TSMLoc url_loc, string param)
 }
 
 string
-generateWMParam(TSMBuffer remapBuf, TSMLoc remapLoc,
-             TSMLoc remapUrlLoc, string queryString, WMParameterConfig *addParamConfig)
+generateWMParam(string queryString, WMParameterConfig *addParamConfig)
 {
   time_t currentTime = currentTimeInSeconds();
   for (string timeshift : addParamConfig->getTimeshiftParams()) {
@@ -72,33 +71,77 @@ generateWMParam(TSMBuffer remapBuf, TSMLoc remapLoc,
     if (!timeshiftValue.empty()) {
       long value = stol(timeshiftValue);
       currentTime = currentTime - value;
-      return "wm=" + to_string(currentTime);
+      break;
     }
   }
-  return "";
+
+  return "wm=" + to_string(currentTime);
 }
 
 void
-remapAddParam(WMParameterConfig *addParamConfig, TSMBuffer remapBuf, TSMLoc remapLoc, TSMLoc remapUrlLoc, const char *query,
-              int queryLength)
+remapAddParam(WMParameterConfig *addParamConfig, TSMBuffer remapBuf, TSMLoc remapLoc, TSMLoc remapUrlLoc, string queryString)
 {
-  string queryString(query, queryLength);
+  string filteredParam = queryString;
   for (string param : addParamConfig->getParams()) {
     if (param.compare("wm") == 0) {
-      string wmParam = generateWMParam(remapBuf, remapLoc, remapUrlLoc, queryString, addParamConfig);
-      if (queryString.length() > 0 && wmParam.length() > 0) {
-        queryString = queryString + "&" + wmParam;
+      string wmParam = generateWMParam(queryString, addParamConfig);
+       filteredParam = filterExcludeParam(queryString, addParamConfig->getTimeshiftParams());
+      if (wmParam.length() > 0) {
+        filteredParam.length() > 0 ? filteredParam += ("&" + wmParam) : filteredParam = wmParam;
       }
     }
   }
-  remapParam(remapBuf, remapLoc, remapUrlLoc, queryString);
+  remapParam(remapBuf, remapUrlLoc, filteredParam);
 }
 
 void
-remapIncludeParam(TSMBuffer buf, TSMLoc loc, TSMLoc url_loc, ParameterConfig *includeParamConfig, const char *query, int queryLength)
+addParams(Configs *config, TSMBuffer pristineUrlBuf, TSMLoc pristineUrlLoc, TSMBuffer remapBuf, TSMLoc remapLoc,
+               char *pristineUrl, int pristineUrlLen, TSMLoc remapUrlLoc)
 {
-  string filteredParam = filterParam(includeParamConfig->getParams(), query, queryLength);
-  remapParam(buf, loc, url_loc, filteredParam);
+  WMParameterConfig *addParamConfig = config->getAddParamConfig();
+  const char *query;
+  int queryLength;
+  if (addParamConfig->isPristineUrl()) {
+    query = TSUrlHttpQueryGet(pristineUrlBuf, pristineUrlLoc, &queryLength);
+  } else {
+    query = TSUrlHttpQueryGet(remapBuf, remapLoc, &queryLength);
+  }
+  TSDebug(PLUGIN_NAME, "Query param of request: %s length %d", query, queryLength);
+  string queryString(query, queryLength);
+  if (addParamConfig->getUrlIncludeRegex() || addParamConfig->getUrlExcludeRegex()) { //  Verify the pristine url of the request that matches regex or not
+    if ((addParamConfig->getUrlIncludeRegex() && filterUrlByRegex(addParamConfig->getUrlIncludeRegex(), addParamConfig->getUrlIncludeRegexExtra(), pristineUrl, pristineUrlLen)) || 
+        (addParamConfig->getUrlExcludeRegex() && !filterUrlByRegex(addParamConfig->getUrlExcludeRegex(), addParamConfig->getUrlExcludeRegexExtra(), pristineUrl, pristineUrlLen))) {
+      remapAddParam(addParamConfig, remapBuf, remapLoc, remapUrlLoc, queryString);
+    }
+  } else {
+    remapAddParam(addParamConfig, remapBuf, remapLoc, remapUrlLoc, queryString);
+  }
+}
+
+void
+includeParams(Configs *config, TSMBuffer pristineUrlBuf, TSMLoc pristineUrlLoc, TSMBuffer remapBuf, TSMLoc remapLoc,
+                   char *pristineUrl, int pristineUrlLen, TSMLoc remapUrlLoc)
+{
+  ParameterConfig *includeParamConfig = config->getIncludeParamConfig();
+  const char *query;
+  int queryLength;
+  if (includeParamConfig->isPristineUrl()) {
+    query = TSUrlHttpQueryGet(pristineUrlBuf, pristineUrlLoc, &queryLength);
+  } else {
+    query = TSUrlHttpQueryGet(remapBuf, remapLoc, &queryLength);
+  }
+  TSDebug(PLUGIN_NAME, "Query param of request: %s length %d", query, queryLength);
+  string queryString(query, queryLength);
+ if (includeParamConfig->getUrlIncludeRegex() || includeParamConfig->getUrlExcludeRegex()) { //  Verify the pristine url of the request that matches regex or not
+    if ((includeParamConfig->getUrlIncludeRegex() && filterUrlByRegex(includeParamConfig->getUrlIncludeRegex(), includeParamConfig->getUrlIncludeRegexExtra(), pristineUrl, pristineUrlLen)) || 
+        (includeParamConfig->getUrlExcludeRegex() && !filterUrlByRegex(includeParamConfig->getUrlExcludeRegex(), includeParamConfig->getUrlExcludeRegexExtra(), pristineUrl, pristineUrlLen))) {
+      string filteredParam = filterIncludeParam(queryString, includeParamConfig->getParams());
+      remapParam(remapBuf, remapUrlLoc, filteredParam);
+    }
+  } else {
+    string filteredParam = filterIncludeParam(queryString, includeParamConfig->getParams());
+    remapParam(remapBuf, remapUrlLoc, filteredParam);
+  }
 }
 
 TSReturnCode
@@ -142,13 +185,7 @@ void
 TSRemapDeleteInstance(void *instance)
 {
   Configs *config = static_cast<Configs *>(instance);
-  if (config->shouldAddParams()) {
-    delete config->getAddParamConfig();
-  } 
-  if (config->shouldIncludeParams()) {
-    delete config->getIncludeParamConfig();
-  }
-  config->freeRegex();
+  config->free();
   delete config;
 }
 
@@ -165,39 +202,21 @@ TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo *rri)
   TSMLoc pristineUrlLoc;
   if (TS_SUCCESS == TSHttpTxnPristineUrlGet(txnp, &pristineUrlBuf, &pristineUrlLoc)) {
     pristineUrl = TSUrlStringGet(pristineUrlBuf, pristineUrlLoc, &pristineUrlLen);
+  } else {
+    TSError("[%s] failed to get pristine url", PLUGIN_NAME);
+    return TSREMAP_NO_REMAP;
   }
-  
 
   if (TS_SUCCESS == TSHttpTxnClientReqGet(txnp, &remapBuf, &remapLoc) && config != nullptr) {
-    const char *query;
-    int queryLength;
     TSMLoc remapUrlLoc;
     if (TS_SUCCESS == TSHttpHdrUrlGet(remapBuf, remapLoc, &remapUrlLoc)) {
-      query = TSUrlHttpQueryGet(remapBuf, remapUrlLoc, &queryLength);
-      TSDebug(PLUGIN_NAME, "Query param of request: %s length %d", query, queryLength);
-      
-      if (query != nullptr && queryLength > 0) {
-        
-        if (config->shouldIncludeParams()) { // should include param or not
-          ParameterConfig* includeParamConfig = config->getIncludeParamConfig();
-          if (includeParamConfig->getUrlRegex()) { //  Verify the pristine url of the request that matches regex or not
-            if (filterUrlByRegex(includeParamConfig->getUrlRegex(), includeParamConfig->getUrlRegexExtra(), pristineUrl, pristineUrlLen)) {
-              remapIncludeParam(remapBuf, remapLoc, remapUrlLoc, includeParamConfig, query, queryLength);
-            }
-          } else {
-            remapIncludeParam(remapBuf, remapLoc, remapUrlLoc, includeParamConfig, query, queryLength);
-          }
-        }
-        if (config->shouldAddParams()) { // should add param or not
-          WMParameterConfig* addParamConfig = config->getAddParamConfig();
-          if (addParamConfig->getUrlRegex()) { //  Verify the pristine url of the request that matches regex or not
-            if (filterUrlByRegex(addParamConfig->getUrlRegex(), addParamConfig->getUrlRegexExtra(), pristineUrl, pristineUrlLen)) { 
-              remapAddParam(addParamConfig, remapBuf, remapLoc, remapUrlLoc, query, queryLength);
-            }
-          } else {
-            remapAddParam(addParamConfig, remapBuf, remapLoc, remapUrlLoc, query, queryLength);
-          }
-        }
+      // should include param or not
+      if (config->shouldIncludeParams()) {
+        includeParams(config, pristineUrlBuf, pristineUrlLoc, remapBuf, remapLoc, pristineUrl, pristineUrlLen, remapUrlLoc);
+      }
+      // should add param or not
+      if (config->shouldAddParams()) {
+        addParams(config, pristineUrlBuf, pristineUrlLoc, remapBuf, remapLoc, pristineUrl, pristineUrlLen, remapUrlLoc);
       }
       ASSERT_SUCCESS(TSHandleMLocRelease(remapBuf, remapLoc, remapUrlLoc));
     }
@@ -207,5 +226,3 @@ TSRemapDoRemap(void *instance, TSHttpTxn txnp, TSRemapRequestInfo *rri)
 
   return TSREMAP_NO_REMAP;
 }
-
-
