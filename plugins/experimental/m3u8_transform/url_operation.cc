@@ -139,7 +139,7 @@ extern "C" {
 
 // Remove parameter that not process in origin, append those parameter to every link in m3u8 file later
 string optimize_query_param(string query_param, int* query_param_length, set<string> origin_param,
-                            TSMBuffer buf, TSMLoc loc, bool is_master_manifest, string& time_shift) {
+                            TSMBuffer buf, TSMLoc loc) {
     istringstream paramstream(query_param);
     string param;
 
@@ -151,14 +151,14 @@ string optimize_query_param(string query_param, int* query_param_length, set<str
         string key = param.substr(0, pos);
         string value = param.substr(pos, param.size());
         // We will remove wm param because this param only use for cache key plugin
-        if (key == "wm") {
+        if (key == "wm" || key == "token") {
           continue;
         }
         // In case master manifest and TSTV, we should add time_shift for later use, if not master manifest, we do not use time_shift for anything.
-        if (is_master_manifest && (key == "timeshift" || key == "time_shift" || key == "delay") && time_shift.size() == 0) {
-          time_shift = value;
-        }
-        if (origin_param.size() == 0 || key == "token" || origin_param.find(key) != origin_param.end()) {
+        // if (is_master_manifest && (key == "timeshift" || key == "time_shift" || key == "delay") && time_shift.size() == 0) {
+        //   time_shift = value;
+        // }
+        if (origin_param.size() == 0 || origin_param.find(key) != origin_param.end()) {
             if (request_origin_param.size() == 0) {
                 request_origin_param.append(param);
             } else {
@@ -287,7 +287,7 @@ rewrite_line_with_tag(std::string &line, const std::string &prefix, const std::s
                       Config *cfg)
 {
   size_t uri_pos = line.find("URI=\"");
-  if (uri_pos != string::npos) {
+  if (uri_pos != string::npos && line.rfind("#EXT-X-KEY", 0) != 0) {
     size_t next_quote_pos = line.find("\"", uri_pos + 5);
     if (next_quote_pos != string::npos) {
       string url = prefix + line.substr(uri_pos + 5, next_quote_pos - uri_pos - 5);
