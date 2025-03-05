@@ -5049,6 +5049,7 @@ HttpTransact::set_headers_for_cache_write(State *s, HTTPInfo *cache_info, HTTPHd
   }
 
   DUMP_HEADER("http_hdrs", cache_info->request_get(), s->state_machine_id, "Cached Request Hdr");
+  DUMP_HEADER("http_hdrs", cache_info->response_get(), s->state_machine_id, "Cached Response Hdr");
 }
 
 void
@@ -6811,10 +6812,10 @@ HttpTransact::handle_content_length_header(State *s, HTTPHdr *header, HTTPHdr *b
         change_response_header_because_of_range_request(s, header);
         s->hdr_info.trust_response_cl = true;
       } else {
-        if (header->status_get() != HTTP_STATUS_NO_CONTENT) {
-          header->set_content_length(cl);
-        }
-        s->hdr_info.trust_response_cl = true;
+        // if (header->status_get() != HTTP_STATUS_NO_CONTENT) {
+        //   header->set_content_length(cl);
+        // }
+        s->hdr_info.trust_response_cl = false;
       }
     } else {
       // Check to see if there is no content length
